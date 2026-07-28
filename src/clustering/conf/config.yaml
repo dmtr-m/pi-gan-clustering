@@ -1,0 +1,11 @@
+# Default composition for the clustering experiment.
+#
+# `base_config` is the structured (typed) schema registered from main.py via
+# ConfigStore; `_self_` lets any keys written directly in this file win last.
+# Add a preset on the CLI with, e.g., `+experiment=quick`.
+#
+# Every field below lives in ClusteringConfig (main.py) and is overridable on the
+# command line, e.g. `clustering-run use_critic=false split_lr=1e-4 stages=[3]`.
+defaults:
+  - base_config
+  - _self_

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pigan-clustering"
+version = "0.1.0"
+description = "Nuclear multifragmentation clustering experiment (Hydra + Aim harness)."
+requires-python = ">=3.10"
+# Runtime dependencies are pinned in requirements.txt and already installed in
+# .venv; they are intentionally not duplicated here so `pip install -e .` only
+# registers the package + console script without re-resolving the environment.
+
+[project.scripts]
+clustering-run = "clustering.experiment:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+clustering = ["conf/**/*.yaml"]

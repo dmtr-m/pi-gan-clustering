@@ -6,13 +6,13 @@ import numpy as np
 from typing import Dict, List, Tuple
 from torch.utils.data import DataLoader
 
-from physics import (
+from clustering.physics import (
     weizsacker_per_nucleon_formula,
     binding_energy,
     total_potential_energy,
     fragment_energy,
 )
-from module import SplitPredictionModel
+from clustering.split_prediction.model import SplitPredictionModel
 
 # ─── K-level forward pass ─────────────────────────────────────────────────────
 

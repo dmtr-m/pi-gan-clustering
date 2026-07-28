@@ -1,0 +1,11 @@
+# @package _global_
+#
+# Tiny-scale preset for smoke tests. Add with `+experiment=quick`.
+# Overrides top-level fields (hence the `_global_` package) so the full
+# 3-stage pipeline runs end-to-end in seconds instead of minutes.
+n_events: 40
+n_vis: 15
+sc_a_max: 12
+
+pretrain_epochs: 1
+split_epochs: 2

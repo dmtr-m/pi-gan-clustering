@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-from stability_classifier.module import StabilityLookup
-from split_prediction_model.module import SplitPredictionModel
+from clustering.stability.lookup import StabilityLookup
+from clustering.split_prediction.model import SplitPredictionModel
 
 
 @dataclass

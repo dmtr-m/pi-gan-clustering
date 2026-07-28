@@ -10,26 +10,35 @@ Pipeline
   Stage 2  train the up-to-K-way SplitPredictionModel (REINFORCE) -> dm_model.pt
   Stage 3  run FragmentsIdentifier and plot fragment distributions
 
-The stability oracle is now a table lookup (no training, no sc_model.pt); Stage 3
+The stability oracle is a table lookup (no training, no sc_model.pt); Stage 3
 reads the CSV directly, so Stage 1 is purely a diagnostic and is not a
 prerequisite for Stage 3.
 
-Figures are written to ``<out_dir>/figures`` (this is a script, so nothing is
-shown interactively).
+Harness
+-------
+Configuration is Hydra (`conf/config.yaml`, structured schema ``ClusteringConfig``)
+and every run is tracked with Aim into a single project-root ``.aim`` store.  All
+artifacts (checkpoints, figures, the resolved config) are written into the
+per-run Hydra output dir — never a fixed path.  See README.md.
+
+After `pip install -e .`, run from anywhere via the `clustering-run` console
+script (equivalently `python -m clustering.experiment`).
 
 Examples
 --------
-  python main.py                         # run all three stages
-  python main.py --stages 2 3            # retrain split + viz
-  python main.py --n-clusters 4 --split-epochs 120
-  python main.py --stages 3 --force-split   # viz bypassing the stability lookup
+  clustering-run                              # run all three stages (Actor-Critic)
+  clustering-run use_critic=false             # raw REINFORCE (EMA baseline), no code fork
+  clustering-run stages=[2,3] n_clusters=4 split_epochs=120
+  clustering-run +experiment=quick            # tiny smoke test
+  clustering-run stages=[3] load_split_from=/path/to/prev_run   # viz an old checkpoint
+  clustering-run --multirun split_lr=1e-4,3e-4,1e-3             # sweep, one Aim run each
 """
 from __future__ import annotations
 
-import argparse
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use("Agg")  # headless: save figures instead of showing them
@@ -40,23 +49,31 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from split_prediction_model.dataset import NucleonDataset, collate_fn
-from split_prediction_model.module import SplitPredictionModel, SplitValueCritic
-from split_prediction_model.mst import MSTPretrainer
-from split_prediction_model.trainer import KSplitTrainer
-from stability_classifier.module import StabilityLookup
-from module import FragmentsIdentifier
+import aim
+import hydra
+from hydra.core.config_store import ConfigStore
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf
+
+from clustering.split_prediction.dataset import NucleonDataset, collate_fn
+from clustering.split_prediction.model import SplitPredictionModel, SplitValueCritic
+from clustering.split_prediction.mst import MSTPretrainer
+from clustering.split_prediction.trainer import KSplitTrainer
+from clustering.stability.lookup import StabilityLookup
+from clustering.identifier import FragmentsIdentifier
 
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-# Anchor data to the repo layout rather than the current working directory, so
-# `python main.py` works from anywhere.  Layout:
-#   pi-gan-experiments/
-#     data/                                     <- DATA_DIR
-#     src/hierarchical_clustering_v4/main.py     <- this file
+# Anchor data and the Aim store to the repo layout rather than the current
+# working directory, so the code works no matter where it is run from.  Layout:
+#   pi-gan/                            <- REPO_ROOT
+#     data/                            <- DATA_DIR
+#     .aim/                            <- single Aim store (pinned; see README)
+#     src/clustering/experiment.py     <- this file
 _HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = _HERE.parents[1]            # pi-gan-experiments/
-DATA_DIR = PROJECT_ROOT / "data"
+REPO_ROOT = _HERE.parents[1]               # pi-gan/
+DATA_DIR = REPO_ROOT / "data"
+AIM_REPO = str(REPO_ROOT / ".aim")
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -70,22 +87,31 @@ def _default_device() -> str:
 
 
 @dataclass
-class Config:
+class ClusteringConfig:
+    """Structured (typed) Hydra schema — mirrors the old ``Config`` dataclass.
+
+    Every field is overridable on the CLI.  Derived paths (checkpoints, figures)
+    are NOT config fields: they live under the per-run Hydra output dir and are
+    computed at runtime by ``Ctx`` — see ``main``.
+    """
+
+    # Which of the 3 pipeline stages to run.
+    stages: List[int] = field(default_factory=lambda: [1, 2, 3])
+
     # Paths (absolute, anchored to the repo layout — cwd-independent)
     data_path: str = str(DATA_DIR / "xexe_urqmd_5fm.parquet")
     csv_path: str = str(DATA_DIR / "existing_nuclei_amc_5fm.csv")
-    out_dir: str = str(_HERE)
-    device: str = field(default_factory=_default_device)
+    device: str = "auto"          # "auto" -> mps / cuda / cpu (resolved at runtime)
 
     # Data
     n_events: int = 500
     particle_type: str = "SpectatorsLeft"
 
     # Stage 1 — Stability lookup table (no training; diagnostic plot only)
-    sc_a_max: int = 30           # upper A for the stability-map diagnostic grid
+    sc_a_max: int = 30            # upper A for the stability-map diagnostic grid
 
     # Stage 2 — SplitPredictionModel (up-to-K-way)
-    n_clusters: int = 5          # K: max fragments produced per split
+    n_clusters: int = 5           # K: max fragments produced per split
     hidden_dim: int = 32
     n_iters: int = 3
     split_epochs: int = 40
@@ -98,7 +124,8 @@ class Config:
     split_k: int = 8
     baseline_momentum: float = 0.95
 
-    # Actor-Critic: DeepSets V(s) replaces the scalar EMA baseline
+    # Actor-Critic: DeepSets V(s) replaces the scalar EMA baseline.
+    # use_critic=false is a pure config flip to raw REINFORCE (no code fork).
     use_critic: bool = True
     critic_hidden_dim: int = 64
     value_coef: float = 0.5
@@ -106,37 +133,76 @@ class Config:
     # MST supervised warm-start (runs before REINFORCE; 0 disables)
     pretrain_epochs: int = 25
     pretrain_lr: float = 1e-3
-    mst_d_cut: float = 2.0       # fm; >2.5 percolates -> collapses to "never split"
+    mst_d_cut: float = 2.0        # fm; >2.5 percolates -> collapses to "never split"
 
     # Stage 3 — FragmentsIdentifier visualization
     # depth 8 is enough to peel every nucleon free if the model wants to
     # (2^8 = 256 > the largest event), so the depth limit never binds
     max_depth: int = 8
     n_vis: int = 200
-    force_split: bool = False    # True bypasses the stability lookup
+    force_split: bool = False     # True bypasses the stability lookup
 
     type_index: int = 7
     input_dim: int = 8
 
-    # Derived paths -----------------------------------------------------------
+    # Checkpoint reuse: load split-model weights from a previous run instead of
+    # retraining, so Stage 3 can run standalone.  Accepts a run dir (looks for
+    # dm_model.pt inside) or a direct .pt path.  None -> use this run's dm_model.pt.
+    load_split_from: Optional[str] = None
+
+
+# ─── Runtime context ──────────────────────────────────────────────────────────
+
+class Ctx:
+    """Ties a resolved config to its per-run output dir and Aim run.
+
+    Everything that writes to disk or tracks a metric goes through here, so no
+    function ever hard-codes an output path.  ``cfg`` stays a plain ``DictConfig``
+    for hyperparameter reads (``ctx.cfg.n_clusters`` etc.).
+    """
+
+    def __init__(self, cfg: DictConfig, out_dir: Path, run: "aim.Run | None") -> None:
+        self.cfg = cfg
+        self.out_dir = Path(out_dir)
+        self.run = run
+
     @property
     def dm_model_path(self) -> Path:
-        return Path(self.out_dir) / "dm_model.pt"
+        return self.out_dir / "dm_model.pt"
 
     @property
     def critic_model_path(self) -> Path:
-        return Path(self.out_dir) / "critic_model.pt"
+        return self.out_dir / "critic_model.pt"
 
     @property
     def fig_dir(self) -> Path:
-        d = Path(self.out_dir) / "figures"
+        d = self.out_dir / "figures"
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def track(self, value, name: str, step: "int | None" = None, context: "dict | None" = None) -> None:
+        if self.run is not None:
+            self.run.track(value, name=name, step=step, context=context or {})
+
+    def save_fig(self, fig: plt.Figure, name: str) -> None:
+        fig.tight_layout()
+        path = self.fig_dir / name
+        fig.savefig(path, dpi=120)
+        # Logging figures to Aim is nice-to-have; never let it break a run.
+        if self.run is not None:
+            try:
+                self.run.track(aim.Image(fig), name=Path(name).stem,
+                               context={"stage": "figures"})
+            except Exception as exc:  # pragma: no cover - best-effort
+                print(f"[aim] skipped image {name}: {exc}")
+        plt.close(fig)
+        print(f"Saved {path}")
 
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
 
-def load_dataset(cfg: Config) -> NucleonDataset:
+def load_dataset(exp: Ctx) -> NucleonDataset:
+    cfg = exp.cfg
     ds = NucleonDataset(cfg.data_path, particle_type=cfg.particle_type, n_events=cfg.n_events)
     sizes = [ds[i].shape[0] for i in range(len(ds))]
     print(f"Events         : {len(ds)}")
@@ -146,18 +212,20 @@ def load_dataset(cfg: Config) -> NucleonDataset:
 
 # ─── Stage 1 — Stability lookup table ──────────────────────────────────────────
 
-def build_stability_lookup(cfg: Config) -> StabilityLookup:
+def build_stability_lookup(exp: Ctx) -> StabilityLookup:
+    cfg = exp.cfg
     print("\n=== Stage 1 — Stability lookup table ===")
     lut = StabilityLookup(cfg.csv_path)
     print(f"Loaded {len(lut)} known nuclei from {cfg.csv_path}")
-    _plot_stability_table(cfg, lut)
+    _plot_stability_table(exp, lut)
     return lut
 
 
-def _plot_stability_table(cfg: Config, lut: StabilityLookup) -> None:
+def _plot_stability_table(exp: Ctx, lut: StabilityLookup) -> None:
     """Map of the lookup over the (A, Z) plane: green = stable (in table)."""
     import pandas as pd
 
+    cfg = exp.cfg
     df_stable = pd.read_csv(cfg.csv_path)
     grid = [(A, Z) for A in range(2, cfg.sc_a_max + 1) for Z in range(0, A + 1)]
     stable = np.array([lut.is_stable(A, Z) for A, Z in grid], dtype=float)
@@ -171,12 +239,13 @@ def _plot_stability_table(cfg: Config, lut: StabilityLookup) -> None:
     fig.colorbar(sc, ax=ax, label="stable (lookup)")
     ax.set(xlabel="A", ylabel="Z", title="Stability lookup table")
     ax.legend()
-    _save(cfg, fig, "stability_table.png")
+    exp.save_fig(fig, "stability_table.png")
 
 
 # ─── Stage 2 — Up-to-K-way split model ─────────────────────────────────────────
 
-def train_split_model(cfg: Config, dataset: NucleonDataset) -> SplitPredictionModel:
+def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel:
+    cfg = exp.cfg
     print(f"\n=== Stage 2 — Up-to-K-way split (K={cfg.n_clusters}, k={cfg.split_k}) ===")
     model = SplitPredictionModel(
         input_dim=cfg.input_dim,
@@ -224,17 +293,34 @@ def train_split_model(cfg: Config, dataset: NucleonDataset) -> SplitPredictionMo
         device=cfg.device,
     )
     history = trainer.train(n_epochs=cfg.split_epochs)
-    torch.save(model.state_dict(), cfg.dm_model_path)
-    print(f"Saved {cfg.dm_model_path}")
+    torch.save(model.state_dict(), exp.dm_model_path)
+    print(f"Saved {exp.dm_model_path}")
     if critic is not None:
-        torch.save(critic.state_dict(), cfg.critic_model_path)
-        print(f"Saved {cfg.critic_model_path}")
+        torch.save(critic.state_dict(), exp.critic_model_path)
+        print(f"Saved {exp.critic_model_path}")
 
-    _plot_split_history(cfg, history)
+    _track_split_history(exp, history)
+    _plot_split_history(exp, history)
     return model
 
 
-def _plot_split_history(cfg: Config, history: Dict[str, List[float]]) -> None:
+def _track_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
+    """Log Stage-2 per-epoch curves to Aim (step = epoch, context stage=split)."""
+    use_critic = exp.cfg.use_critic
+    n = len(history["loss"])
+    for i in range(n):
+        epoch = i + 1
+        ctx = {"stage": "split"}
+        exp.track(history["reward"][i], name="reward", step=epoch, context=ctx)
+        exp.track(history["eval_reward"][i], name="eval_reward", step=epoch, context=ctx)
+        exp.track(history["baseline"][i], name="baseline", step=epoch, context=ctx)
+        exp.track(history["loss"][i], name="loss", step=epoch, context=ctx)
+        if use_critic:
+            exp.track(history["value_loss"][i], name="value_loss", step=epoch, context=ctx)
+
+
+def _plot_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
+    cfg = exp.cfg
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     ax1.plot(history["eval_reward"], label="eval reward (argmax split)", color="C2")
     ax1.plot(history["reward"], label="sampled reward", color="C0", alpha=0.5)
@@ -250,12 +336,34 @@ def _plot_split_history(cfg: Config, history: Dict[str, List[float]]) -> None:
         ax2.axhline(1.0, color="grey", lw=0.8, alpha=0.6)
         ax2.legend()
     ax2.set(xlabel="Epoch", ylabel="Loss", title=f"KSplitTrainer (K={cfg.n_clusters}) — Losses")
-    _save(cfg, fig, "split_history.png")
+    exp.save_fig(fig, "split_history.png")
 
 
 # ─── Stage 3 — Fragment identification & visualization ─────────────────────────
 
-def build_identifier(cfg: Config) -> FragmentsIdentifier:
+def _resolve_split_ckpt(exp: Ctx) -> Path:
+    """Path to the split-model weights Stage 3 should load.
+
+    ``load_split_from`` (a previous run dir or a direct .pt) takes precedence, so
+    Stage 3 can run without retraining; otherwise this run's ``dm_model.pt``.
+    """
+    src = exp.cfg.load_split_from
+    if src:
+        p = Path(src)
+        ckpt = p / "dm_model.pt" if p.is_dir() else p
+    else:
+        ckpt = exp.dm_model_path
+    if not ckpt.exists():
+        raise FileNotFoundError(
+            f"Split-model checkpoint not found: {ckpt}. Run Stage 2 first, or set "
+            f"load_split_from=<previous run dir> to reuse an existing dm_model.pt."
+        )
+    return ckpt
+
+
+def build_identifier(exp: Ctx) -> FragmentsIdentifier:
+    cfg = exp.cfg
+    ckpt = _resolve_split_ckpt(exp)
     fi = FragmentsIdentifier(
         max_depth=cfg.max_depth,
         input_dim=cfg.input_dim,
@@ -265,15 +373,17 @@ def build_identifier(cfg: Config) -> FragmentsIdentifier:
         csv_path=cfg.csv_path,
         force_split=cfg.force_split,
     )
-    fi.split_prediction_module.load_state_dict(torch.load(cfg.dm_model_path))
+    print(f"Loading split model from {ckpt}")
+    fi.split_prediction_module.load_state_dict(torch.load(ckpt))
     fi.to(cfg.device)
     fi.eval()
     return fi
 
 
-def visualize_fragments(cfg: Config) -> None:
+def visualize_fragments(exp: Ctx) -> None:
+    cfg = exp.cfg
     print("\n=== Stage 3 — Fragment identification & visualization ===")
-    fi = build_identifier(cfg)
+    fi = build_identifier(exp)
 
     vis_datasets = {
         "SpectatorsLeft": NucleonDataset(cfg.data_path, particle_type="SpectatorsLeft"),
@@ -364,30 +474,47 @@ def visualize_fragments(cfg: Config) -> None:
     n_frags_arr = np.array(n_frags_per_event)
     split_depths_arr = np.array(split_depths)
 
-    print(f"Events           : {cfg.n_vis * len(vis_datasets)}")
-    print(f"Fragments total  : {len(nuclei_A_arr)}  "
-          f"(A=1: {(nuclei_A_arr == 1).sum()}, A>=2: {(nuclei_A_arr >= 2).sum()})")
+    n_events_seen = cfg.n_vis * len(vis_datasets)
+    n_frag_total = len(nuclei_A_arr)
+    n_a1 = int((nuclei_A_arr == 1).sum())
+    n_a2 = int((nuclei_A_arr >= 2).sum())
+    max_level = int(split_depths_arr.max()) if len(split_depths_arr) else 0
+
+    print(f"Events           : {n_events_seen}")
+    print(f"Fragments total  : {n_frag_total}  (A=1: {n_a1}, A>=2: {n_a2})")
     print(f"Fragments/event  : min={n_frags_arr.min()}, "
           f"mean={n_frags_arr.mean():.1f}, max={n_frags_arr.max()}")
-    print(f"Splits total     : {len(split_depths_arr)}  "
-          f"(max tree level: {split_depths_arr.max() if len(split_depths_arr) else 0})")
+    print(f"Splits total     : {len(split_depths_arr)}  (max tree level: {max_level})")
 
-    _plot_n_fragments(cfg, n_frags_arr)
-    _plot_splits_per_level(cfg, split_depths_arr)
-    _plot_eta(cfg, np.array(nucleon_eta), np.array(nuclei_eta))
-    _plot_az_nz(cfg, nuclei_A_arr, nuclei_Z_arr, nuclei_N_arr)
+    # Stage-3 summary scalars -> Aim (single values, context stage=fragments).
+    frag_ctx = {"stage": "fragments"}
+    exp.track(n_events_seen, name="events", context=frag_ctx)
+    exp.track(n_frag_total, name="fragments_total", context=frag_ctx)
+    exp.track(n_a1, name="fragments_A1", context=frag_ctx)
+    exp.track(n_a2, name="fragments_A2plus", context=frag_ctx)
+    exp.track(float(n_frags_arr.mean()), name="fragments_per_event_mean", context=frag_ctx)
+    exp.track(int(n_frags_arr.min()), name="fragments_per_event_min", context=frag_ctx)
+    exp.track(int(n_frags_arr.max()), name="fragments_per_event_max", context=frag_ctx)
+    exp.track(len(split_depths_arr), name="splits_total", context=frag_ctx)
+    exp.track(max_level, name="max_tree_level", context=frag_ctx)
+    exp.track(float(np.nanmean(ev_max_z)), name="max_charge_mean", context=frag_ctx)
+
+    _plot_n_fragments(exp, n_frags_arr)
+    _plot_splits_per_level(exp, split_depths_arr)
+    _plot_eta(exp, np.array(nucleon_eta), np.array(nuclei_eta))
+    _plot_az_nz(exp, nuclei_A_arr, nuclei_Z_arr, nuclei_N_arr)
 
     # Event-level diagnostics
-    _plot_conservation(cfg, np.array(cons_dA), np.array(cons_dZ),
+    _plot_conservation(exp, np.array(cons_dA), np.array(cons_dZ),
                        np.array(cons_dpx), np.array(cons_dpy),
                        np.array(cons_dpz), np.array(cons_dE))
-    _plot_mean_pt(cfg, np.array(ev_nucleon_pt), np.array(ev_frag_pt_pn))
-    _plot_max_charge(cfg, np.array(ev_max_z))
-    _plot_n_nucleons(cfg, np.array(ev_n_nucleons))
-    _plot_pn_ratio(cfg, np.array(ev_pn_ratio))
+    _plot_mean_pt(exp, np.array(ev_nucleon_pt), np.array(ev_frag_pt_pn))
+    _plot_max_charge(exp, np.array(ev_max_z))
+    _plot_n_nucleons(exp, np.array(ev_n_nucleons))
+    _plot_pn_ratio(exp, np.array(ev_pn_ratio))
 
 
-def _plot_splits_per_level(cfg: Config, split_depths: np.ndarray) -> None:
+def _plot_splits_per_level(exp: Ctx, split_depths: np.ndarray) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     if len(split_depths):
         levels = np.arange(0, split_depths.max() + 2)
@@ -396,10 +523,10 @@ def _plot_splits_per_level(cfg: Config, split_depths: np.ndarray) -> None:
         ax.set_xticks(np.arange(0, split_depths.max() + 1))
     ax.set(xlabel="Tree level (split depth)", ylabel="Number of splits",
            title="Splits per tree level")
-    _save(cfg, fig, "splits_per_level.png")
+    exp.save_fig(fig, "splits_per_level.png")
 
 
-def _plot_n_fragments(cfg: Config, n_frags: np.ndarray) -> None:
+def _plot_n_fragments(exp: Ctx, n_frags: np.ndarray) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     bins = np.arange(n_frags.min(), n_frags.max() + 2) - 0.5
     ax.hist(n_frags, bins=bins, color="mediumseagreen", edgecolor="black", lw=0.5)
@@ -408,19 +535,19 @@ def _plot_n_fragments(cfg: Config, n_frags: np.ndarray) -> None:
     ax.set(xlabel="Fragments per event", ylabel="Events",
            title="Fragment multiplicity")
     ax.legend()
-    _save(cfg, fig, "fragment_multiplicity.png")
+    exp.save_fig(fig, "fragment_multiplicity.png")
 
 
-def _plot_eta(cfg: Config, nucleon_eta: np.ndarray, nuclei_eta: np.ndarray) -> None:
+def _plot_eta(exp: Ctx, nucleon_eta: np.ndarray, nuclei_eta: np.ndarray) -> None:
     fig, (ax_nu, ax_nuc) = plt.subplots(1, 2, figsize=(14, 5))
     ax_nu.hist(nucleon_eta, bins=100, color="steelblue")
     ax_nu.set(xlabel="Pseudorapidity η", ylabel="Count", title="Nucleons (pre-split)")
     ax_nuc.hist(nuclei_eta, bins=100, color="darkorange")
     ax_nuc.set(xlabel="Pseudorapidity η", ylabel="Count", title="Identified fragments (all A)")
-    _save(cfg, fig, "fragment_eta.png")
+    exp.save_fig(fig, "fragment_eta.png")
 
 
-def _plot_az_nz(cfg: Config, A: np.ndarray, Z: np.ndarray, N: np.ndarray) -> None:
+def _plot_az_nz(exp: Ctx, A: np.ndarray, Z: np.ndarray, N: np.ndarray) -> None:
     fig, (ax_AZ, ax_NZ) = plt.subplots(1, 2, figsize=(12, 5))
     bins_A = np.arange(0, 22) - 0.5
     bins_Z = np.arange(0, 15) - 0.5
@@ -431,12 +558,12 @@ def _plot_az_nz(cfg: Config, A: np.ndarray, Z: np.ndarray, N: np.ndarray) -> Non
     h2 = ax_NZ.hist2d(N, Z, bins=[bins_N, bins_Z], cmap="viridis", norm=LogNorm())
     ax_NZ.set(xlabel="N", ylabel="Z", title="N vs Z")
     fig.colorbar(h2[3], ax=ax_NZ, label="Count")
-    _save(cfg, fig, "fragment_az_nz.png")
+    exp.save_fig(fig, "fragment_az_nz.png")
 
 
 # ─── Event-level diagnostics ────────────────────────────────────────────────────
 
-def _plot_conservation(cfg: Config, dA: np.ndarray, dZ: np.ndarray,
+def _plot_conservation(exp: Ctx, dA: np.ndarray, dZ: np.ndarray,
                        dpx: np.ndarray, dpy: np.ndarray, dpz: np.ndarray,
                        dE: np.ndarray) -> None:
     """Per-event residuals Σ(fragments) − Σ(nucleons).
@@ -460,10 +587,10 @@ def _plot_conservation(cfg: Config, dA: np.ndarray, dZ: np.ndarray,
         ax.axvline(0, color="crimson", ls="--", lw=1)
         ax.set(title=f"{title}   max|Δ| = {np.abs(data).max():.1e}", ylabel="Events")
     fig.suptitle("Conservation laws  (Σ fragments − Σ nucleons, per event)", fontsize=14)
-    _save(cfg, fig, "conservation.png")
+    exp.save_fig(fig, "conservation.png")
 
 
-def _plot_mean_pt(cfg: Config, nucleon_pt: np.ndarray, frag_pt_pn: np.ndarray) -> None:
+def _plot_mean_pt(exp: Ctx, nucleon_pt: np.ndarray, frag_pt_pn: np.ndarray) -> None:
     frag_pt_pn = frag_pt_pn[np.isfinite(frag_pt_pn)]
     fig, ax = plt.subplots(figsize=(8, 5))
     hi = max(nucleon_pt.max(), frag_pt_pn.max()) if len(frag_pt_pn) else nucleon_pt.max()
@@ -475,10 +602,10 @@ def _plot_mean_pt(cfg: Config, nucleon_pt: np.ndarray, frag_pt_pn: np.ndarray) -
     ax.set(xlabel="⟨pₜ⟩ per event [GeV/c]", ylabel="Events",
            title="Mean transverse momentum")
     ax.legend()
-    _save(cfg, fig, "mean_pt.png")
+    exp.save_fig(fig, "mean_pt.png")
 
 
-def _plot_max_charge(cfg: Config, max_z: np.ndarray) -> None:
+def _plot_max_charge(exp: Ctx, max_z: np.ndarray) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     bins = np.arange(0, max_z.max() + 2) - 0.5
     ax.hist(max_z, bins=bins, color="indianred", edgecolor="black", lw=0.5)
@@ -487,10 +614,10 @@ def _plot_max_charge(cfg: Config, max_z: np.ndarray) -> None:
     ax.set(xlabel="Maximum fragment charge Z", ylabel="Events",
            title="Maximum charge per event")
     ax.legend()
-    _save(cfg, fig, "max_charge.png")
+    exp.save_fig(fig, "max_charge.png")
 
 
-def _plot_n_nucleons(cfg: Config, n_nuc: np.ndarray) -> None:
+def _plot_n_nucleons(exp: Ctx, n_nuc: np.ndarray) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     bins = np.arange(n_nuc.min(), n_nuc.max() + 2) - 0.5
     ax.hist(n_nuc, bins=bins, color="mediumpurple", edgecolor="black", lw=0.5)
@@ -499,10 +626,10 @@ def _plot_n_nucleons(cfg: Config, n_nuc: np.ndarray) -> None:
     ax.set(xlabel="Nucleons per event", ylabel="Events",
            title="Number of nucleons")
     ax.legend()
-    _save(cfg, fig, "n_nucleons.png")
+    exp.save_fig(fig, "n_nucleons.png")
 
 
-def _plot_pn_ratio(cfg: Config, pn_ratio: np.ndarray) -> None:
+def _plot_pn_ratio(exp: Ctx, pn_ratio: np.ndarray) -> None:
     pn_ratio = pn_ratio[np.isfinite(pn_ratio)]
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(pn_ratio, bins=40, color="seagreen", edgecolor="black", lw=0.3)
@@ -511,85 +638,87 @@ def _plot_pn_ratio(cfg: Config, pn_ratio: np.ndarray) -> None:
     ax.set(xlabel="Z / N  (protons / neutrons)", ylabel="Events",
            title="Proton-to-neutron ratio")
     ax.legend()
-    _save(cfg, fig, "pn_ratio.png")
+    exp.save_fig(fig, "pn_ratio.png")
 
 
-# ─── Plot helper ───────────────────────────────────────────────────────────────
+# ─── Reproducibility ───────────────────────────────────────────────────────────
 
-def _save(cfg: Config, fig: plt.Figure, name: str) -> None:
-    fig.tight_layout()
-    path = cfg.fig_dir / name
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-    print(f"Saved {path}")
+def _git_info() -> Dict[str, object]:
+    """Current commit SHA + dirty-tree flag, for reproducibility.  Warns if dirty."""
+    def _git(*args: str) -> str:
+        return subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), *args], stderr=subprocess.DEVNULL
+        ).decode().strip()
+
+    try:
+        sha = _git("rev-parse", "HEAD")
+        dirty = bool(_git("status", "--porcelain"))
+    except Exception:
+        print("[git] not a git repo or git unavailable; SHA not recorded.")
+        return {"sha": None, "dirty": None}
+
+    if dirty:
+        print("[git] WARNING: working tree is dirty — this run is not reproducible "
+              "from the recorded SHA alone.")
+    return {"sha": sha, "dirty": dirty}
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
 
-def run(cfg: Config, stages: List[int]) -> None:
+def run(exp: Ctx) -> None:
+    cfg = exp.cfg
+    stages = list(cfg.stages)
     print(f"Device: {cfg.device}")
-    Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
-    dataset = None
+    print(f"Output dir: {exp.out_dir}")
     if 1 in stages:
-        build_stability_lookup(cfg)
+        build_stability_lookup(exp)
     if 2 in stages:
-        dataset = load_dataset(cfg)
-        train_split_model(cfg, dataset)
+        dataset = load_dataset(exp)
+        train_split_model(exp, dataset)
     if 3 in stages:
-        visualize_fragments(cfg)
+        visualize_fragments(exp)
 
 
-def _parse_args() -> argparse.Namespace:
-    cfg = Config()
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stages", type=int, nargs="+", choices=[1, 2, 3], default=[1, 2, 3],
-                   help="Which stages to run (default: all).")
-    p.add_argument("--device", default=cfg.device, help="torch device (default: auto).")
-    p.add_argument("--out-dir", default=cfg.out_dir, help="Where to write models and figures/.")
-    p.add_argument("--data-path", default=cfg.data_path)
-    p.add_argument("--csv-path", default=cfg.csv_path)
-    p.add_argument("--n-events", type=int, default=cfg.n_events)
-    # Stage 2 knobs (the focus of this experiment)
-    p.add_argument("--n-clusters", type=int, default=cfg.n_clusters,
-                   help="K: max fragments produced per split.")
-    p.add_argument("--split-k", type=int, default=cfg.split_k,
-                   help="Split-tree depth; every node is rewarded independently. "
-                        "k=1 is a single up-to-K split.")
-    p.add_argument("--no-critic", action="store_true",
-                   help="Disable the Actor-Critic value head; use the scalar EMA baseline.")
-    p.add_argument("--split-epochs", type=int, default=cfg.split_epochs)
-    p.add_argument("--pretrain-epochs", type=int, default=cfg.pretrain_epochs,
-                   help="MST supervised warm-start epochs before REINFORCE (0 disables).")
-    p.add_argument("--mst-d-cut", type=float, default=cfg.mst_d_cut,
-                   help="MST coordinate cut [fm]; >2.5 percolates into one giant fragment.")
-    p.add_argument("--hidden-dim", type=int, default=cfg.hidden_dim)
-    p.add_argument("--max-depth", type=int, default=cfg.max_depth)
-    p.add_argument("--n-vis", type=int, default=cfg.n_vis)
-    p.add_argument("--force-split", action="store_true",
-                   help="Stage 3: always split, bypassing the stability lookup.")
-    return p.parse_args()
+# Register the structured schema at import time so it is available whether the
+# entrypoint is reached via the `clustering-run` console script, `python -m
+# clustering.experiment`, or direct execution.
+ConfigStore.instance().store(name="base_config", node=ClusteringConfig)
 
 
-def main() -> None:
-    args = _parse_args()
-    cfg = Config(
-        data_path=args.data_path,
-        csv_path=args.csv_path,
-        out_dir=args.out_dir,
-        device=args.device,
-        n_events=args.n_events,
-        n_clusters=args.n_clusters,
-        hidden_dim=args.hidden_dim,
-        split_epochs=args.split_epochs,
-        pretrain_epochs=args.pretrain_epochs,
-        mst_d_cut=args.mst_d_cut,
-        split_k=args.split_k,
-        use_critic=not args.no_critic,
-        max_depth=args.max_depth,
-        n_vis=args.n_vis,
-        force_split=args.force_split,
-    )
-    run(cfg, args.stages)
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig) -> None:
+    # Resolve device before anything else so it lands in both the dumped config
+    # and the Aim hparams.
+    if cfg.device == "auto":
+        cfg.device = _default_device()
+
+    out_dir = Path(HydraConfig.get().runtime.output_dir)
+    git = _git_info()
+
+    # Dump the fully-resolved config (+ git provenance) into THIS run's dir.
+    resolved = OmegaConf.to_container(cfg, resolve=True)
+    dump = OmegaConf.create({"config": resolved, "git": git})
+    (out_dir / "resolved_config.yaml").write_text(OmegaConf.to_yaml(dump))
+
+    # One Aim run per invocation, pinned to the single project-root store so that
+    # Hydra's per-run cwd/output dir can't scatter runs into separate .aim stores
+    # (which would silently break cross-run comparison — the whole point).
+    aim_run = aim.Run(repo=AIM_REPO, experiment="clustering")
+    aim_run["hparams"] = resolved
+    aim_run["git"] = git
+    aim_run["output_dir"] = str(out_dir)
+    if git["sha"]:
+        aim_run.add_tag(f"sha:{git['sha'][:8]}")
+    if git["dirty"]:
+        aim_run.add_tag("dirty")
+    aim_run.add_tag(f"particle:{cfg.particle_type}")
+    aim_run.add_tag(f"critic:{'on' if cfg.use_critic else 'off'}")
+
+    exp = Ctx(cfg, out_dir, aim_run)
+    try:
+        run(exp)
+    finally:
+        aim_run.close()
 
 
 if __name__ == "__main__":

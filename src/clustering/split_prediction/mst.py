@@ -24,7 +24,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from torch.utils.data import DataLoader
 
-from module import SplitPredictionModel
+from clustering.split_prediction.model import SplitPredictionModel
 
 # Cluster-recognition cuts.
 #

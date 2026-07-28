@@ -2,6 +2,10 @@ __pycache__/
 *.py[cod]
 .venv/
 .DS_Store
+# Packaging (editable install)
+*.egg-info/
+build/
+dist/
 # Experiment outputs
 outputs/
 multirun/
