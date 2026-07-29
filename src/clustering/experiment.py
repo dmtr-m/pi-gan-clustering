@@ -124,6 +124,13 @@ class ClusteringConfig:
     split_k: int = 8
     baseline_momentum: float = 0.95
 
+    # Reward definition for the per-split-node energy U (reward q = (U_parent −
+    # ΣU_child)/N).  "qmd_asym" = QMD potential + asymmetry penalty (the main
+    # branch's reward); "weizsacker_qmd" = qmd_weight·V − W (maximize Weizsäcker
+    # binding W, minimize QMD potential V).  qmd_weight is λ on the QMD term.
+    reward_type: str = "weizsacker_qmd"
+    qmd_weight: float = 1.0
+
     # Actor-Critic: DeepSets V(s) replaces the scalar EMA baseline.
     # use_critic=false is a pure config flip to raw REINFORCE (no code fork).
     use_critic: bool = True
@@ -291,6 +298,8 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         baseline_momentum=cfg.baseline_momentum,
         type_index=cfg.type_index,
         device=cfg.device,
+        reward_type=cfg.reward_type,
+        qmd_weight=cfg.qmd_weight,
     )
     history = trainer.train(n_epochs=cfg.split_epochs)
     torch.save(model.state_dict(), exp.dm_model_path)
@@ -713,6 +722,7 @@ def main(cfg: DictConfig) -> None:
         aim_run.add_tag("dirty")
     aim_run.add_tag(f"particle:{cfg.particle_type}")
     aim_run.add_tag(f"critic:{'on' if cfg.use_critic else 'off'}")
+    aim_run.add_tag(f"reward:{cfg.reward_type}")
 
     exp = Ctx(cfg, out_dir, aim_run)
     try:

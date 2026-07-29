@@ -6,11 +6,14 @@ import numpy as np
 from typing import Dict, List, Tuple
 from torch.utils.data import DataLoader
 
+from functools import partial
+
 from clustering.physics import (
     weizsacker_per_nucleon_formula,
     binding_energy,
     total_potential_energy,
     fragment_energy,
+    weizsacker_qmd_energy,
 )
 from clustering.split_prediction.model import SplitPredictionModel
 
@@ -111,6 +114,7 @@ def iter_split_nodes(
     k: int,
     min_fragment_size: int = 2,
     type_index: int = 7,
+    energy_fn=fragment_energy,
 ):
     """Walk k levels of splitting, **yielding one record per split node**.
 
@@ -158,14 +162,14 @@ def iter_split_nodes(
             assignments, log_probs = model(x_node, node_mask)  # (B,N), (B,N)
             child_masks = [(assignments == c) & node_mask for c in range(n_clusters)]
 
-            U_node = fragment_energy(x, node_mask, type_index)  # (B,)
+            U_node = energy_fn(x, node_mask, type_index)  # (B,)
             U_child = x.new_zeros(B)
             n_large_children = x.new_zeros(B)
             for cm in child_masks:
                 big = cm.sum(dim=1) >= min_fragment_size  # (B,)
                 n_large_children = n_large_children + big.float()
                 if big.any():
-                    U_child[big] = U_child[big] + fragment_energy(x[big], cm[big], type_index)
+                    U_child[big] = U_child[big] + energy_fn(x[big], cm[big], type_index)
             n_node = n_node_raw.float().clamp(min=1)
             q = (U_node - U_child) / n_node  # (B,)
             z = ((x[..., type_index] == 1) & node_mask).sum(dim=1).float()  # (B,)
@@ -213,6 +217,7 @@ def compute_k_level_reward(
     leaf_masks: Dict[Tuple, torch.Tensor],
     type_index: int = 7,
     min_fragment_size: int = 2,
+    energy_fn=fragment_energy,
 ) -> torch.Tensor:
     """QMD-driven split reward.  Returns (B,) tensor.
 
@@ -240,14 +245,14 @@ def compute_k_level_reward(
     ``min_fragment_size`` is retained for API compatibility; leaves below it
     (i.e. singletons) have ``U = 0`` and so do not affect ``Σ U(leaf)`` anyway.
     """
-    U_parent = fragment_energy(x, mask, type_index)  # (B,)
+    U_parent = energy_fn(x, mask, type_index)  # (B,)
     B = x.shape[0]
     U_leaves = x.new_zeros(B)
     for lm in leaf_masks.values():
         non_empty = lm.sum(dim=1) >= min_fragment_size  # (B,)
         if non_empty.any():
             U_leaves[non_empty] = (
-                U_leaves[non_empty] + fragment_energy(x[non_empty], lm[non_empty], type_index)
+                U_leaves[non_empty] + energy_fn(x[non_empty], lm[non_empty], type_index)
             )
     n_parent = mask.sum(dim=1).float().clamp(min=1)  # (B,)
     return (U_parent - U_leaves) / n_parent
@@ -479,6 +484,8 @@ class KSplitTrainer:
         grad_clip: float = 1.0,
         type_index: int = 7,
         min_fragment_size: int = 2,
+        reward_type: str = "qmd_asym",
+        qmd_weight: float = 1.0,
     ) -> None:
         self.model = model.to(device)
         self.critic = critic.to(device) if critic is not None else None
@@ -495,6 +502,19 @@ class KSplitTrainer:
         self.grad_clip = grad_clip
         self.type_index = type_index
         self.min_fragment_size = min_fragment_size
+
+        # Per-node energy U(fragment); the split reward is q = (U_parent − ΣU_child)/N.
+        #   "qmd_asym"       U = QMD potential + asymmetry penalty      (the main-branch reward)
+        #   "weizsacker_qmd" U = qmd_weight·V − W  (maximize Weizsäcker W, minimize QMD V)
+        if reward_type == "qmd_asym":
+            self.energy_fn = fragment_energy
+        elif reward_type == "weizsacker_qmd":
+            self.energy_fn = partial(weizsacker_qmd_energy, qmd_weight=qmd_weight)
+        else:
+            raise ValueError(
+                f"unknown reward_type {reward_type!r}; expected 'qmd_asym' or 'weizsacker_qmd'"
+            )
+        self.reward_type = reward_type
 
     def _step(
         self, x: torch.Tensor, mask: torch.Tensor
@@ -517,7 +537,8 @@ class KSplitTrainer:
         n_nodes = 0
 
         for rec in iter_split_nodes(
-            self.model, x, mask, self.k, self.min_fragment_size, self.type_index
+            self.model, x, mask, self.k, self.min_fragment_size, self.type_index,
+            energy_fn=self.energy_fn,
         ):
             v = rec["valid"]
             if not v.any():
@@ -631,6 +652,7 @@ class KSplitTrainer:
                 x[valid], mask[valid],
                 {p: m[valid] for p, m in result["leaf_masks"].items()},
                 self.type_index, self.min_fragment_size,
+                energy_fn=self.energy_fn,
             )
             rewards.extend(r.cpu().tolist())
         return float(np.mean(rewards)) if rewards else 0.0

@@ -7,26 +7,37 @@ import numpy as np
 
 
 def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor):
-    a_1 = 15.75  # MeV
-    a_2 = 17.80  # MeV
-    a_3 = 0.711  # MeV
-    a_4 = 23.70  # MeV
-    
-    # TODO: Rewrite this condition for torch condidtions
-    # a_5 = 0
-    # if A % 2 == 0 and Z % 2 == 0:
-    #     a_5 = 34
-    # if A % 2 == 1 and Z % 2 == 1:
-    #     a_5 = - 34
+    """Weizsäcker semi-empirical binding energy B(A, Z) [MeV] (extensive).
+
+    volume − surface − Coulomb − asymmetry + pairing.
+
+    The pairing term δ (the parity correction) is now implemented, vectorized in
+    torch — previously a disabled Python-scalar ``if`` TODO:
+        δ = +a_p·A^(−3/4)  even-even,   −a_p·A^(−3/4)  odd-odd,   0  when A is odd.
+    """
+    a_1 = 15.75  # MeV  volume
+    a_2 = 17.80  # MeV  surface
+    a_3 = 0.711  # MeV  Coulomb
+    a_4 = 23.70  # MeV  asymmetry  (NOTE: pairs with the (A/2 − Z)² form — see TODO.md)
+    a_p = 34.0   # MeV  pairing
 
     assert (A > 0).all()
+
+    A = A.float()
+    Z = Z.float()
+    N = A - Z
+    even_even = (torch.remainder(Z, 2) == 0) & (torch.remainder(N, 2) == 0)
+    odd_odd = (torch.remainder(Z, 2) == 1) & (torch.remainder(N, 2) == 1)
+    pairing = a_p * torch.pow(A, -3.0 / 4.0)
+    delta = torch.where(even_even, pairing, torch.zeros_like(A))
+    delta = torch.where(odd_odd, -pairing, delta)
 
     weizsacker_energy = (
         a_1 * A
         - a_2 * torch.pow(A, 2 / 3)
         - a_3 * Z**2 / torch.pow(A, 1 / 3)
         - a_4 * (A / 2 - Z) ** 2 / A
-        # + a_5 * np.pow(A, - 3 / 4)
+        + delta
     )
 
     return weizsacker_energy
@@ -171,6 +182,38 @@ def fragment_energy(
     A = mask.sum(dim=1).float()                                       # (B,)
     Z = ((nucleons[..., type_index] == 1) & mask).sum(dim=1).float()  # (B,)
     return total_potential_energy(nucleons, mask) + asymmetry_energy(A, Z)
+
+
+def weizsacker_qmd_energy(
+    nucleons: torch.Tensor,
+    mask: torch.Tensor,
+    type_index: int = 7,
+    qmd_weight: float = 1.0,
+) -> torch.Tensor:
+    """Per-node energy for the Weizsäcker reward:  U = qmd_weight·V − W.
+
+    ``V`` = ``binding_energy`` (mean pairwise QMD potential; negative = bound),
+    ``W`` = ``weizsacker_per_nucleon_formula`` (B/A; positive = bound).  Both are
+    intensive (per-nucleon / per-pair) — the affinity scale.  A well-bound
+    physical nucleus has V very negative and W large, so U is low; the split
+    reward ``q = (U_parent − Σ U_child) / N`` is then maximized by carving off
+    children with **high W and low V** — i.e. maximize Weizsäcker, minimize QMD.
+
+    W is undefined for A < 2 (the liquid-drop picture is meaningless for a free
+    nucleon, and ``weizsacker_formula`` asserts A > 0), so W is taken as 0 there;
+    ``binding_energy`` already returns 0 for sets with no pairs.
+
+    See TODO.md for the two alternatives kept in reserve (an extensive-total
+    scale, and a terminal Σ-over-fragments reward instead of this per-node delta).
+    """
+    A = mask.sum(dim=1).float()                                       # (B,)
+    Z = ((nucleons[..., type_index] == 1) & mask).sum(dim=1).float()  # (B,)
+    W = torch.zeros_like(A)
+    big = A >= 2
+    if big.any():
+        W[big] = weizsacker_per_nucleon_formula(A[big], Z[big])
+    V = binding_energy(nucleons, mask)
+    return qmd_weight * V - W
 
 
 def _calculate_skyrme_potential(
