@@ -486,6 +486,7 @@ class KSplitTrainer:
         min_fragment_size: int = 2,
         reward_type: str = "qmd_asym",
         qmd_weight: float = 1.0,
+        energy_scale: str = "extensive",
     ) -> None:
         self.model = model.to(device)
         self.critic = critic.to(device) if critic is not None else None
@@ -505,16 +506,24 @@ class KSplitTrainer:
 
         # Per-node energy U(fragment); the split reward is q = (U_parent − ΣU_child)/N.
         #   "qmd_asym"       U = QMD potential + asymmetry penalty      (the main-branch reward)
-        #   "weizsacker_qmd" U = qmd_weight·V − W  (maximize Weizsäcker W, minimize QMD V)
+        #   "weizsacker_qmd" U = qmd_weight·V − W  (maximize Weizsäcker W, minimize QMD V),
+        #                    with energy_scale = "extensive" | "per_nucleon" (see weizsacker_qmd_energy)
         if reward_type == "qmd_asym":
             self.energy_fn = fragment_energy
         elif reward_type == "weizsacker_qmd":
-            self.energy_fn = partial(weizsacker_qmd_energy, qmd_weight=qmd_weight)
+            if energy_scale not in ("extensive", "per_nucleon"):
+                raise ValueError(
+                    f"unknown energy_scale {energy_scale!r}; expected 'extensive' or 'per_nucleon'"
+                )
+            self.energy_fn = partial(
+                weizsacker_qmd_energy, qmd_weight=qmd_weight, scale=energy_scale
+            )
         else:
             raise ValueError(
                 f"unknown reward_type {reward_type!r}; expected 'qmd_asym' or 'weizsacker_qmd'"
             )
         self.reward_type = reward_type
+        self.energy_scale = energy_scale
 
     def _step(
         self, x: torch.Tensor, mask: torch.Tensor

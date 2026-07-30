@@ -189,30 +189,49 @@ def weizsacker_qmd_energy(
     mask: torch.Tensor,
     type_index: int = 7,
     qmd_weight: float = 1.0,
+    scale: str = "extensive",
 ) -> torch.Tensor:
     """Per-node energy for the Weizsäcker reward:  U = qmd_weight·V − W.
 
-    ``V`` = ``binding_energy`` (mean pairwise QMD potential; negative = bound),
-    ``W`` = ``weizsacker_per_nucleon_formula`` (B/A; positive = bound).  Both are
-    intensive (per-nucleon / per-pair) — the affinity scale.  A well-bound
-    physical nucleus has V very negative and W large, so U is low; the split
-    reward ``q = (U_parent − Σ U_child) / N`` is then maximized by carving off
-    children with **high W and low V** — i.e. maximize Weizsäcker, minimize QMD.
+    The split reward ``q = (U_parent − Σ U_child) / N`` maximizes W and minimizes
+    V (weighted by ``qmd_weight``) — "maximize Weizsäcker binding, minimize QMD".
 
-    W is undefined for A < 2 (the liquid-drop picture is meaningless for a free
-    nucleon, and ``weizsacker_formula`` asserts A > 0), so W is taken as 0 there;
-    ``binding_energy`` already returns 0 for sets with no pairs.
+    ``scale`` selects how W and V are measured:
 
-    See TODO.md for the two alternatives kept in reserve (an extensive-total
-    scale, and a terminal Σ-over-fragments reward instead of this per-node delta).
+    - ``"extensive"`` (default): ``W`` = ``weizsacker_formula`` (total binding
+      B(A,Z) [MeV]), ``V`` = ``total_potential_energy`` (Σ over pairs [MeV]).
+      Both are **extensive** (additive over disjoint fragments), so a split's
+      reward is a genuine energy balance: ``V_parent − ΣV_child`` is exactly the
+      inter-fragment interaction the split breaks, and W's surface term makes
+      merging into fewer, larger nuclei favorable — both resist over-splitting.
+    - ``"per_nucleon"``: ``W`` = ``weizsacker_per_nucleon_formula`` (B/A),
+      ``V`` = ``binding_energy`` (mean pairwise) — intensive / "affinity" scale.
+      Kept for comparison; it washes out the extensive energy signal and tends to
+      over-split into free nucleons (see the analysis in the branch history).
+
+    Note on sign: on the spectator data ``V`` is Pauli-repulsion-dominated and
+    **positive**, so "minimize QMD" means reducing repulsion between over-close
+    nucleons (which favors splitting) — the opposite pressure to W's merge bias;
+    ``qmd_weight`` tunes the balance.
+
+    W is undefined for A < 2 (``weizsacker_formula`` asserts A > 0 and the
+    liquid-drop picture is meaningless for a free nucleon), so W = 0 there; the
+    QMD energy already returns 0 for sets with no pairs.
     """
     A = mask.sum(dim=1).float()                                       # (B,)
     Z = ((nucleons[..., type_index] == 1) & mask).sum(dim=1).float()  # (B,)
     W = torch.zeros_like(A)
     big = A >= 2
-    if big.any():
-        W[big] = weizsacker_per_nucleon_formula(A[big], Z[big])
-    V = binding_energy(nucleons, mask)
+    if scale == "extensive":
+        if big.any():
+            W[big] = weizsacker_formula(A[big], Z[big])
+        V = total_potential_energy(nucleons, mask)
+    elif scale == "per_nucleon":
+        if big.any():
+            W[big] = weizsacker_per_nucleon_formula(A[big], Z[big])
+        V = binding_energy(nucleons, mask)
+    else:
+        raise ValueError(f"unknown scale {scale!r}; expected 'extensive' or 'per_nucleon'")
     return qmd_weight * V - W
 
 

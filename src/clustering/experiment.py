@@ -35,6 +35,7 @@ Examples
 """
 from __future__ import annotations
 
+import random
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,6 +87,20 @@ def _default_device() -> str:
     return "cpu"
 
 
+def _seed_everything(seed: int) -> None:
+    """Seed python / numpy / torch so a run is reproducible from its logged seed.
+
+    Not full bit-determinism (no ``use_deterministic_algorithms`` — MPS/GPU kernels
+    can still vary slightly), but it pins the model init, data shuffling, and
+    action sampling, which is what makes seed sweeps meaningful.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)  # also seeds the MPS/CUDA generators in recent torch
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 @dataclass
 class ClusteringConfig:
     """Structured (typed) Hydra schema — mirrors the old ``Config`` dataclass.
@@ -97,6 +112,12 @@ class ClusteringConfig:
 
     # Which of the 3 pipeline stages to run.
     stages: List[int] = field(default_factory=lambda: [1, 2, 3])
+
+    # RNG seed. None -> a fresh random seed is drawn each run and recorded in the
+    # resolved config + Aim hparams, so any run (even a lucky one) is reproducible
+    # by re-running with seed=<that value>.  Set an int to fix it directly, e.g.
+    # for a seed sweep: --multirun seed=0,1,2,3,4.
+    seed: Optional[int] = None
 
     # Paths (absolute, anchored to the repo layout — cwd-independent)
     data_path: str = str(DATA_DIR / "xexe_urqmd_5fm.parquet")
@@ -128,8 +149,12 @@ class ClusteringConfig:
     # ΣU_child)/N).  "qmd_asym" = QMD potential + asymmetry penalty (the main
     # branch's reward); "weizsacker_qmd" = qmd_weight·V − W (maximize Weizsäcker
     # binding W, minimize QMD potential V).  qmd_weight is λ on the QMD term.
+    # energy_scale (weizsacker_qmd only): "extensive" (total B + total pairwise
+    # QMD, additive — resists over-splitting) or "per_nucleon" (B/A + mean
+    # pairwise, the affinity scale that tends to over-split).
     reward_type: str = "weizsacker_qmd"
     qmd_weight: float = 1.0
+    energy_scale: str = "extensive"
 
     # Actor-Critic: DeepSets V(s) replaces the scalar EMA baseline.
     # use_critic=false is a pure config flip to raw REINFORCE (no code fork).
@@ -300,6 +325,7 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         device=cfg.device,
         reward_type=cfg.reward_type,
         qmd_weight=cfg.qmd_weight,
+        energy_scale=cfg.energy_scale,
     )
     history = trainer.train(n_epochs=cfg.split_epochs)
     torch.save(model.state_dict(), exp.dm_model_path)
@@ -701,6 +727,13 @@ def main(cfg: DictConfig) -> None:
     if cfg.device == "auto":
         cfg.device = _default_device()
 
+    # Draw-and-record the seed (if unset) before dumping the config, so the run is
+    # reproducible from its logged seed.  Seed the RNGs before any model/data use.
+    if cfg.seed is None:
+        cfg.seed = random.randrange(2**31 - 1)
+    _seed_everything(cfg.seed)
+    print(f"Seed: {cfg.seed}")
+
     out_dir = Path(HydraConfig.get().runtime.output_dir)
     git = _git_info()
 
@@ -723,6 +756,8 @@ def main(cfg: DictConfig) -> None:
     aim_run.add_tag(f"particle:{cfg.particle_type}")
     aim_run.add_tag(f"critic:{'on' if cfg.use_critic else 'off'}")
     aim_run.add_tag(f"reward:{cfg.reward_type}")
+    if cfg.reward_type == "weizsacker_qmd":
+        aim_run.add_tag(f"scale:{cfg.energy_scale}")
 
     exp = Ctx(cfg, out_dir, aim_run)
     try:
