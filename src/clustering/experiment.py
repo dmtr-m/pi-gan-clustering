@@ -144,6 +144,11 @@ class ClusteringConfig:
     # nodes per batch instead of the 97k an unpruned BFS would enumerate.
     split_k: int = 8
     baseline_momentum: float = 0.95
+    # Max total gradient norm; actor and critic are clipped separately to this.
+    # Track it against the grad_norm plot: the actor norm has been ~40x this, so
+    # updates are clip-limited — raise to let more gradient through, or lower to
+    # tighten. Sweep it, e.g. --multirun grad_clip=0.5,1,5,20.
+    grad_clip: float = 1.0
 
     # Reward definition for the per-split-node energy U (reward q = (U_parent −
     # ΣU_child)/N).  "qmd_asym" = QMD potential + asymmetry penalty (the main
@@ -321,6 +326,7 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         critic=critic,
         value_coef=cfg.value_coef,
         baseline_momentum=cfg.baseline_momentum,
+        grad_clip=cfg.grad_clip,
         type_index=cfg.type_index,
         device=cfg.device,
         reward_type=cfg.reward_type,
