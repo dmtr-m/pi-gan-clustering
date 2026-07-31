@@ -35,6 +35,7 @@ Examples
 """
 from __future__ import annotations
 
+import math
 import random
 import subprocess
 from dataclasses import dataclass, field
@@ -101,6 +102,34 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _build_scheduler(optimizer: optim.Optimizer, cfg: DictConfig):
+    """LambdaLR: optional linear warmup, then constant or cosine decay.
+
+    Stepped once per epoch by the trainer.  Returns a factor on ``split_lr``:
+    warmup ramps 0 -> 1 over ``lr_warmup_epochs``; afterwards it is 1 (constant)
+    or a cosine from 1 down to ``lr_min_factor`` over the remaining epochs.
+    ``constant`` with no warmup reproduces a fixed LR (the previous behavior).
+    """
+    if cfg.lr_schedule not in ("constant", "cosine"):
+        raise ValueError(
+            f"unknown lr_schedule {cfg.lr_schedule!r}; expected 'constant' or 'cosine'"
+        )
+    warmup = int(cfg.lr_warmup_epochs)
+    total = int(cfg.split_epochs)
+    lo = float(cfg.lr_min_factor)
+
+    def lr_lambda(epoch: int) -> float:  # epoch = scheduler.last_epoch (0-indexed)
+        if warmup > 0 and epoch < warmup:
+            return (epoch + 1) / warmup
+        if cfg.lr_schedule == "cosine":
+            progress = (epoch - warmup) / max(1, total - warmup)
+            progress = min(max(progress, 0.0), 1.0)
+            return lo + (1.0 - lo) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 1.0
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 @dataclass
 class ClusteringConfig:
     """Structured (typed) Hydra schema — mirrors the old ``Config`` dataclass.
@@ -149,6 +178,16 @@ class ClusteringConfig:
     # updates are clip-limited — raise to let more gradient through, or lower to
     # tighten. Sweep it, e.g. --multirun grad_clip=0.5,1,5,20.
     grad_clip: float = 1.0
+    # Learning-rate schedule (Stage 2), stepped once per epoch. LR is the real
+    # step-size lever under AdamW (grad_clip is scale-invariant), so this is the
+    # main stability knob to sweep.
+    #   lr_schedule: "constant" (default, LR = split_lr throughout) or "cosine"
+    #                (decay from split_lr to lr_min_factor*split_lr over training).
+    #   lr_warmup_epochs: linearly ramp LR 0 -> split_lr over the first N epochs.
+    #   lr_min_factor: cosine floor as a fraction of split_lr.
+    lr_schedule: str = "constant"
+    lr_warmup_epochs: int = 0
+    lr_min_factor: float = 0.0
 
     # Reward definition for the per-split-node energy U (reward q = (U_parent −
     # ΣU_child)/N).  "qmd_asym" = QMD potential + asymmetry penalty (the main
@@ -316,7 +355,7 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
     print(f"--- REINFORCE ({'Actor-Critic' if critic else 'EMA baseline'}) ---")
 
     optimizer = optim.AdamW(params, lr=cfg.split_lr)
-    scheduler = optim.lr_scheduler.ConstantLR(optimizer)
+    scheduler = _build_scheduler(optimizer, cfg)
     trainer = KSplitTrainer(
         model,
         loader,
@@ -358,6 +397,7 @@ def _track_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
         exp.track(history["baseline"][i], name="baseline", step=epoch, context=ctx)
         exp.track(history["loss"][i], name="loss", step=epoch, context=ctx)
         exp.track(history["grad_norm"][i], name="grad_norm", step=epoch, context=ctx)
+        exp.track(history["lr"][i], name="lr", step=epoch, context=ctx)
         if use_critic:
             exp.track(history["value_loss"][i], name="value_loss", step=epoch, context=ctx)
 

@@ -674,17 +674,21 @@ class KSplitTrainer:
     def train(self, n_epochs: int, verbose: bool = True, log_every: int = 1) -> Dict[str, List[float]]:
         history: Dict[str, List[float]] = {
             "loss": [], "reward": [], "eval_reward": [], "baseline": [], "value_loss": [],
-            "grad_norm": [],
+            "grad_norm": [], "lr": [],
         }
         for ep in range(1, n_epochs + 1):
+            lr = self.optim.param_groups[0]["lr"]  # LR used for this epoch
             avg_loss, avg_reward, avg_value_loss, avg_grad_norm = self.train_epoch()
             eval_reward = self.eval_reward()
+            if self.scheduler is not None:
+                self.scheduler.step()  # advance the LR schedule once per epoch
             history["loss"].append(avg_loss)
             history["reward"].append(avg_reward)
             history["eval_reward"].append(eval_reward)
             history["baseline"].append(self.baseline)
             history["value_loss"].append(avg_value_loss)
             history["grad_norm"].append(avg_grad_norm)
+            history["lr"].append(lr)
             if verbose and ep % log_every == 0:
                 critic_msg = f"  v_loss={avg_value_loss:.3f}" if self.critic is not None else ""
                 print(
@@ -694,6 +698,7 @@ class KSplitTrainer:
                     f"eval={eval_reward:.4f}  "
                     f"baseline={self.baseline:.4f}"
                     f"  grad={avg_grad_norm:.3f}"
+                    f"  lr={lr:.2e}"
                     f"{critic_msg}"
                 )
         return history
