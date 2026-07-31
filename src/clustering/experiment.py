@@ -336,6 +336,7 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
 
     _track_split_history(exp, history)
     _plot_split_history(exp, history)
+    _plot_grad_norm(exp, history)
     return model
 
 
@@ -350,6 +351,7 @@ def _track_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
         exp.track(history["eval_reward"][i], name="eval_reward", step=epoch, context=ctx)
         exp.track(history["baseline"][i], name="baseline", step=epoch, context=ctx)
         exp.track(history["loss"][i], name="loss", step=epoch, context=ctx)
+        exp.track(history["grad_norm"][i], name="grad_norm", step=epoch, context=ctx)
         if use_critic:
             exp.track(history["value_loss"][i], name="value_loss", step=epoch, context=ctx)
 
@@ -372,6 +374,23 @@ def _plot_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
         ax2.legend()
     ax2.set(xlabel="Epoch", ylabel="Loss", title=f"KSplitTrainer (K={cfg.n_clusters}) — Losses")
     exp.save_fig(fig, "split_history.png")
+
+
+def _plot_grad_norm(exp: Ctx, history: Dict[str, List[float]]) -> None:
+    """Actor gradient norm per epoch (measured before clipping).
+
+    The clip threshold (1.0) is drawn for reference: points above it were clipped.
+    """
+    gn = history.get("grad_norm", [])
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(gn, color="C3", marker=".", ms=4, label="‖grad‖ (actor, pre-clip)")
+    ax.axhline(1.0, color="grey", ls="--", lw=1, label="clip threshold (1.0)")
+    if gn and min(gn) > 0:
+        ax.set_yscale("log")
+    ax.set(xlabel="Epoch", ylabel="Gradient norm",
+           title="Actor gradient norm (before clipping)")
+    ax.legend()
+    exp.save_fig(fig, "grad_norm.png")
 
 
 # ─── Stage 3 — Fragment identification & visualization ─────────────────────────

@@ -527,7 +527,7 @@ class KSplitTrainer:
 
     def _step(
         self, x: torch.Tensor, mask: torch.Tensor
-    ) -> Tuple[float, "torch.Tensor | None", float]:
+    ) -> Tuple[float, "torch.Tensor | None", float, float]:
         """One Actor-Critic (or REINFORCE) update. Returns (loss, rewards | None, value_loss).
 
         Each split node is backwarded **as it is produced**, so its graph is freed
@@ -590,11 +590,13 @@ class KSplitTrainer:
             n_nodes += 1
 
         if n_nodes == 0:
-            return 0.0, None, 0.0
+            return 0.0, None, 0.0, 0.0
 
         # Clip actor and critic separately: a shared clip lets the critic's much
         # larger gradient throttle the policy gradient down to nothing.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        # clip_grad_norm_ returns the total norm *before* clipping — capture the
+        # actor's as the gradient-norm diagnostic (no extra backward needed).
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         if self.critic is not None:
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
         self.optim.step()
@@ -603,20 +605,23 @@ class KSplitTrainer:
             total_loss / n_nodes,
             torch.cat(rewards_seen),
             total_value_loss / n_nodes,
+            float(grad_norm),
         )
 
-    def train_epoch(self) -> Tuple[float, float, float]:
+    def train_epoch(self) -> Tuple[float, float, float, float]:
         total_loss = 0.0
         total_value_loss = 0.0
+        total_grad_norm = 0.0
         all_rewards: List[float] = []
         n = 0
         for batch in self.dataloader:
-            loss, rewards, value_loss = self._step(
+            loss, rewards, value_loss, grad_norm = self._step(
                 batch["x"].to(self.device),
                 batch["mask"].to(self.device),
             )
             total_loss += loss
             total_value_loss += value_loss
+            total_grad_norm += grad_norm
             if rewards is not None:
                 all_rewards.extend(rewards.cpu().tolist())
             n += 1
@@ -637,7 +642,7 @@ class KSplitTrainer:
             )
 
         avg_reward = float(np.mean(all_rewards)) if all_rewards else 0.0
-        return total_loss / n, avg_reward, total_value_loss / n
+        return total_loss / n, avg_reward, total_value_loss / n, total_grad_norm / n
 
     @torch.no_grad()
     def eval_reward(self) -> float:
@@ -669,15 +674,17 @@ class KSplitTrainer:
     def train(self, n_epochs: int, verbose: bool = True, log_every: int = 1) -> Dict[str, List[float]]:
         history: Dict[str, List[float]] = {
             "loss": [], "reward": [], "eval_reward": [], "baseline": [], "value_loss": [],
+            "grad_norm": [],
         }
         for ep in range(1, n_epochs + 1):
-            avg_loss, avg_reward, avg_value_loss = self.train_epoch()
+            avg_loss, avg_reward, avg_value_loss, avg_grad_norm = self.train_epoch()
             eval_reward = self.eval_reward()
             history["loss"].append(avg_loss)
             history["reward"].append(avg_reward)
             history["eval_reward"].append(eval_reward)
             history["baseline"].append(self.baseline)
             history["value_loss"].append(avg_value_loss)
+            history["grad_norm"].append(avg_grad_norm)
             if verbose and ep % log_every == 0:
                 critic_msg = f"  v_loss={avg_value_loss:.3f}" if self.critic is not None else ""
                 print(
@@ -686,6 +693,7 @@ class KSplitTrainer:
                     f"reward={avg_reward:.4f}  "
                     f"eval={eval_reward:.4f}  "
                     f"baseline={self.baseline:.4f}"
+                    f"  grad={avg_grad_norm:.3f}"
                     f"{critic_msg}"
                 )
         return history
