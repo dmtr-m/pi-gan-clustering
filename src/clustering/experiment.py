@@ -639,10 +639,17 @@ def _plot_n_fragments(exp: Ctx, n_frags: np.ndarray) -> None:
 
 
 def _plot_eta(exp: Ctx, nucleon_eta: np.ndarray, nuclei_eta: np.ndarray) -> None:
+    # η = -arctanh(pz/|p|) diverges to ±inf for zero-transverse-momentum
+    # fragments/nucleons (momentum along the beam, pz/|p| = ±1). Drop non-finite
+    # values so the histogram range stays finite.
+    nucleon_eta = nucleon_eta[np.isfinite(nucleon_eta)]
+    nuclei_eta = nuclei_eta[np.isfinite(nuclei_eta)]
     fig, (ax_nu, ax_nuc) = plt.subplots(1, 2, figsize=(14, 5))
-    ax_nu.hist(nucleon_eta, bins=100, color="steelblue")
+    if len(nucleon_eta):
+        ax_nu.hist(nucleon_eta, bins=100, color="steelblue")
     ax_nu.set(xlabel="Pseudorapidity η", ylabel="Count", title="Nucleons (pre-split)")
-    ax_nuc.hist(nuclei_eta, bins=100, color="darkorange")
+    if len(nuclei_eta):
+        ax_nuc.hist(nuclei_eta, bins=100, color="darkorange")
     ax_nuc.set(xlabel="Pseudorapidity η", ylabel="Count", title="Identified fragments (all A)")
     exp.save_fig(fig, "fragment_eta.png")
 
