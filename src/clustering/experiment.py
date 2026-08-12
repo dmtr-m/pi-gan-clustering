@@ -149,12 +149,16 @@ class ClusteringConfig:
     seed: Optional[int] = None
 
     # Paths (absolute, anchored to the repo layout — cwd-independent)
-    data_path: str = str(DATA_DIR / "xexe_urqmd_5fm.parquet")
-    csv_path: str = str(DATA_DIR / "existing_nuclei_amc_5fm.csv")
+    data_path: str = str(DATA_DIR / "xecs_hse.parquet")
+    csv_path: str = str(DATA_DIR / "existing_nuclei_XeCs_HSE_Hybrid_mcini.csv")
     device: str = "auto"          # "auto" -> mps / cuda / cpu (resolved at runtime)
 
     # Data
-    n_events: int = 500
+    # HSE (Xe+Cs) is far less homogeneous than the UrQMD Xe+Xe set it replaced:
+    # 56% of nucleons are spectators (vs 18%) and a SpectatorsLeft event carries
+    # ~75 nucleons on average (vs ~23), spanning 2..132.  500 events no longer
+    # samples that spread, hence 2000.  Cost scales ~linearly with this.
+    n_events: int = 2000
     particle_type: str = "SpectatorsLeft"
 
     # Stage 1 — Stability lookup table (no training; diagnostic plot only)
@@ -165,7 +169,9 @@ class ClusteringConfig:
     hidden_dim: int = 32
     n_iters: int = 3
     split_epochs: int = 40
-    split_batch_size: int = 64
+    # 128 on HSE: one optim.step() runs per batch, so a wider batch cuts the
+    # per-step Python/kernel-launch overhead that dominates this small model.
+    split_batch_size: int = 128
     split_lr: float = 3e-4
     # Tree depth for training.  Every split node is rewarded and backwarded
     # independently (no autograd graph is held across levels), and empty /
