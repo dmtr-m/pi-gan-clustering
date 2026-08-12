@@ -164,22 +164,40 @@ class MSTPretrainer:
         attn = self.model.soft_assign(x, mask)               # (B, K, N)
         p_same = pair_probabilities(attn).clamp(1e-6, 1 - 1e-6)  # (B, N, N)
 
-        p, t = p_same[valid], same[valid]
+        # Score every pair and weight the invalid ones to zero, instead of
+        # gathering with p_same[valid].  The gather form raised an intermittent
+        # (~1 run in 3) "target size != input size" ValueError here that we could
+        # not reproduce on demand; keeping every tensor at (B, N, N) removes that
+        # failure mode by construction, and drops two ~1M-element gathers per
+        # batch.  p_same is clamped above, so the log on weight-0 entries is
+        # finite and 0 * finite contributes exactly nothing to loss or grad.
+        #
+        # The assert is what keeps a genuine upstream shape bug loud: without it
+        # the weighted form would silently broadcast rather than raise.  It is
+        # metadata-only, so it costs nothing per step.
+        assert p_same.shape == same.shape == valid.shape, (
+            f"pair shape divergence: p_same={tuple(p_same.shape)} "
+            f"same={tuple(same.shape)} valid={tuple(valid.shape)}"
+        )
+
+        vf = valid.float()
+        n_valid = vf.sum().clamp(min=1.0)
         if self.balance_classes:
             # The pair target is intrinsically imbalanced (the "same" class grows
             # with d_cut).  Unweighted, the majority class alone can drive the
             # model to a constant prediction — at d_cut=3.0 that means "never
             # split", which destroys the policy before RL ever starts.
-            pos = t.mean().clamp(1e-6, 1 - 1e-6)
-            w = torch.where(t > 0.5, 0.5 / pos, 0.5 / (1 - pos))
-            loss = F.binary_cross_entropy(p, t, weight=w)
+            pos = ((same * vf).sum() / n_valid).clamp(1e-6, 1 - 1e-6)
+            w = vf * torch.where(same > 0.5, 0.5 / pos, 0.5 / (1 - pos))
         else:
-            loss = F.binary_cross_entropy(p, t)
+            w = vf
+        # `sum` / n_valid reproduces BCE's weighted `mean` over the valid pairs.
+        loss = F.binary_cross_entropy(p_same, same, weight=w, reduction="sum") / n_valid
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optim.step()
 
-        acc = ((p_same[valid] > 0.5).float() == same[valid]).float().mean()
+        acc = (((p_same > 0.5).float() == same).float() * vf).sum() / n_valid
         return float(loss.item()), float(acc.item())
 
     def train(self, n_epochs: int, verbose: bool = True, log_every: int = 1) -> Dict[str, List[float]]:
