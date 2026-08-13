@@ -162,7 +162,9 @@ class ClusteringConfig:
     particle_type: str = "SpectatorsLeft"
 
     # Stage 1 — Stability lookup table (no training; diagnostic plot only)
-    sc_a_max: int = 30            # upper A for the stability-map diagnostic grid
+    # 130 spans the HSE table (A 2..128); the previous 30 was sized for
+    # amc_5fm (A 2..18) and cropped most of the map on this dataset.
+    sc_a_max: int = 130           # upper A for the stability-map diagnostic grid
 
     # Stage 2 — SplitPredictionModel (up-to-K-way)
     n_clusters: int = 5           # K: max fragments produced per split
@@ -662,9 +664,18 @@ def _plot_eta(exp: Ctx, nucleon_eta: np.ndarray, nuclei_eta: np.ndarray) -> None
 
 def _plot_az_nz(exp: Ctx, A: np.ndarray, Z: np.ndarray, N: np.ndarray) -> None:
     fig, (ax_AZ, ax_NZ) = plt.subplots(1, 2, figsize=(12, 5))
-    bins_A = np.arange(0, 22) - 0.5
-    bins_Z = np.arange(0, 15) - 0.5
-    bins_N = np.arange(0, 15) - 0.5
+    # Bins follow the data.  These were fixed at A<=20 / Z<=13, which comfortably
+    # covered the amc_5fm table (A 2..18, Z 1..8) but silently truncates HSE,
+    # whose fragments reach A~128 / Z~55.  hist2d drops out-of-range entries
+    # without warning, so a heavy residue simply vanished from the figure and
+    # the run looked like it was over-splitting far worse than it was.
+    def _edges(v: np.ndarray) -> np.ndarray:
+        hi = int(v.max()) if len(v) else 1
+        return np.arange(0, hi + 2) - 0.5
+
+    bins_A = _edges(A)
+    bins_Z = _edges(Z)
+    bins_N = _edges(N)
     h1 = ax_AZ.hist2d(A, Z, bins=[bins_A, bins_Z], cmap="viridis", norm=LogNorm())
     ax_AZ.set(xlabel="A", ylabel="Z", title="A vs Z")
     fig.colorbar(h1[3], ax=ax_AZ, label="Count")
