@@ -544,14 +544,36 @@ class KSplitTrainer:
         total_loss = 0.0
         total_value_loss = 0.0
         n_nodes = 0
+        # Diagnostics for the falling-`reward` question.  `reward` is an
+        # *unweighted* mean over split nodes, while eval_reward telescopes the
+        # whole tree weighted by node size.  Since U is extensive pairwise, the
+        # energy a split breaks scales ~N^2 and q divides by N, so q grows
+        # ~linearly with node size: a deepening tree adds many small low-q nodes
+        # and drags the unweighted mean down even when every split improved.
+        # q_weighted (Sigma q*N / Sigma N) is the size-weighted counterpart — if it
+        # holds up while `reward` falls, the drop is that averaging artifact and
+        # not a regression.  node_depth/n_nodes show the population shifting;
+        # valid_frac shows how often a visited node produces a scorable split
+        # (invalid ones are masked out entirely, so they never reach the loss).
+        wq_sum = 0.0     # Sigma q * N over valid (node, item) pairs
+        wn_sum = 0.0     # Sigma N
+        depth_sum = 0.0  # Sigma depth, over valid pairs
+        n_valid_items = 0
+        n_seen_items = 0
 
         for rec in iter_split_nodes(
             self.model, x, mask, self.k, self.min_fragment_size, self.type_index,
             energy_fn=self.energy_fn,
         ):
             v = rec["valid"]
+            n_seen_items += int(v.numel())
             if not v.any():
                 continue
+            n_valid_items += int(v.sum().item())
+            _n = rec["n"][v]
+            wq_sum += float((rec["q"][v] * _n).sum().item())
+            wn_sum += float(_n.sum().item())
+            depth_sum += float(rec["depth"]) * int(v.sum().item())
 
             q = rec["q"][v]                  # (m,) detached, immediate local reward
             log_probs = rec["log_prob"][v]   # (m,) in graph
@@ -589,8 +611,17 @@ class KSplitTrainer:
             rewards_seen.append(q.detach())
             n_nodes += 1
 
+        stats = {
+            "n_nodes": float(n_nodes),
+            "wq_sum": wq_sum,
+            "wn_sum": wn_sum,
+            "depth_sum": depth_sum,
+            "n_valid_items": float(n_valid_items),
+            "n_seen_items": float(n_seen_items),
+        }
+
         if n_nodes == 0:
-            return 0.0, None, 0.0, 0.0
+            return 0.0, None, 0.0, 0.0, stats
 
         # Clip actor and critic separately: a shared clip lets the critic's much
         # larger gradient throttle the policy gradient down to nothing.
@@ -606,22 +637,27 @@ class KSplitTrainer:
             torch.cat(rewards_seen),
             total_value_loss / n_nodes,
             float(grad_norm),
+            stats,
         )
 
-    def train_epoch(self) -> Tuple[float, float, float, float]:
+    def train_epoch(self) -> Tuple[float, float, float, float, Dict[str, float]]:
         total_loss = 0.0
         total_value_loss = 0.0
         total_grad_norm = 0.0
         all_rewards: List[float] = []
+        agg = {"n_nodes": 0.0, "wq_sum": 0.0, "wn_sum": 0.0, "depth_sum": 0.0,
+               "n_valid_items": 0.0, "n_seen_items": 0.0}
         n = 0
         for batch in self.dataloader:
-            loss, rewards, value_loss, grad_norm = self._step(
+            loss, rewards, value_loss, grad_norm, stats = self._step(
                 batch["x"].to(self.device),
                 batch["mask"].to(self.device),
             )
             total_loss += loss
             total_value_loss += value_loss
             total_grad_norm += grad_norm
+            for key in agg:
+                agg[key] += stats[key]
             if rewards is not None:
                 all_rewards.extend(rewards.cpu().tolist())
             n += 1
@@ -642,7 +678,18 @@ class KSplitTrainer:
             )
 
         avg_reward = float(np.mean(all_rewards)) if all_rewards else 0.0
-        return total_loss / n, avg_reward, total_value_loss / n, total_grad_norm / n
+        diag = {
+            # Size-weighted twin of avg_reward.  Same q values, weighted by node
+            # size instead of counted equally — the direct test of whether the
+            # fall in avg_reward is an averaging artifact of a deepening tree.
+            "q_weighted": agg["wq_sum"] / agg["wn_sum"] if agg["wn_sum"] else 0.0,
+            "n_nodes": agg["n_nodes"] / n if n else 0.0,          # per batch
+            "node_depth": (agg["depth_sum"] / agg["n_valid_items"]
+                           if agg["n_valid_items"] else 0.0),
+            "valid_frac": (agg["n_valid_items"] / agg["n_seen_items"]
+                           if agg["n_seen_items"] else 0.0),
+        }
+        return total_loss / n, avg_reward, total_value_loss / n, total_grad_norm / n, diag
 
     @torch.no_grad()
     def eval_reward(self) -> float:
@@ -675,10 +722,12 @@ class KSplitTrainer:
         history: Dict[str, List[float]] = {
             "loss": [], "reward": [], "eval_reward": [], "baseline": [], "value_loss": [],
             "grad_norm": [], "lr": [],
+            # Diagnostics for the falling-`reward` question — see _step.
+            "q_weighted": [], "n_nodes": [], "node_depth": [], "valid_frac": [],
         }
         for ep in range(1, n_epochs + 1):
             lr = self.optim.param_groups[0]["lr"]  # LR used for this epoch
-            avg_loss, avg_reward, avg_value_loss, avg_grad_norm = self.train_epoch()
+            avg_loss, avg_reward, avg_value_loss, avg_grad_norm, diag = self.train_epoch()
             eval_reward = self.eval_reward()
             if self.scheduler is not None:
                 self.scheduler.step()  # advance the LR schedule once per epoch
@@ -689,15 +738,21 @@ class KSplitTrainer:
             history["value_loss"].append(avg_value_loss)
             history["grad_norm"].append(avg_grad_norm)
             history["lr"].append(lr)
+            for key in ("q_weighted", "n_nodes", "node_depth", "valid_frac"):
+                history[key].append(diag[key])
             if verbose and ep % log_every == 0:
                 critic_msg = f"  v_loss={avg_value_loss:.3f}" if self.critic is not None else ""
                 print(
                     f"[KS] {ep:4d}/{n_epochs}  "
                     f"loss={avg_loss:.4f}  "
                     f"reward={avg_reward:.4f}  "
+                    f"qw={diag['q_weighted']:.4f}  "
                     f"eval={eval_reward:.4f}  "
                     f"baseline={self.baseline:.4f}"
                     f"  grad={avg_grad_norm:.3f}"
+                    f"  nodes={diag['n_nodes']:.1f}"
+                    f"  depth={diag['node_depth']:.2f}"
+                    f"  valid={diag['valid_frac']:.2f}"
                     f"  lr={lr:.2e}"
                     f"{critic_msg}"
                 )

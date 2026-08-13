@@ -431,6 +431,12 @@ def _track_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
         exp.track(history["loss"][i], name="loss", step=epoch, context=ctx)
         exp.track(history["grad_norm"][i], name="grad_norm", step=epoch, context=ctx)
         exp.track(history["lr"][i], name="lr", step=epoch, context=ctx)
+        # Diagnostics for the falling-`reward` question: q_weighted is the
+        # size-weighted twin of `reward`, and n_nodes/node_depth show whether the
+        # node population is shifting underneath that unweighted mean.
+        for name in ("q_weighted", "n_nodes", "node_depth", "valid_frac"):
+            if name in history:
+                exp.track(history[name][i], name=name, step=epoch, context=ctx)
         if use_critic:
             exp.track(history["value_loss"][i], name="value_loss", step=epoch, context=ctx)
 
