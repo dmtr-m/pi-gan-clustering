@@ -45,7 +45,8 @@ from typing import Dict, List, Optional
 import matplotlib
 matplotlib.use("Agg")  # headless: save figures instead of showing them
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from matplotlib.colors import ListedColormap, LogNorm
+from matplotlib.patches import Patch
 import numpy as np
 import torch
 import torch.optim as optim
@@ -162,9 +163,12 @@ class ClusteringConfig:
     particle_type: str = "SpectatorsLeft"
 
     # Stage 1 — Stability lookup table (no training; diagnostic plot only)
-    # 130 spans the HSE table (A 2..128); the previous 30 was sized for
-    # amc_5fm (A 2..18) and cropped most of the map on this dataset.
-    sc_a_max: int = 130           # upper A for the stability-map diagnostic grid
+    # None -> size the grid to the nuclei table itself, plus a margin of
+    # max(10%, 5 nucleons) so the map shows some unstable space beyond the
+    # heaviest known nucleus.  Any fixed value crops silently when the dataset
+    # changes: 30 suited amc_5fm (A<=18) but hid most of HSE (A<=128), and 130
+    # would in turn crop Au (A=197) or Pb (A=208).  Set an int to zoom in.
+    sc_a_max: Optional[int] = None  # upper A for the stability-map diagnostic grid
 
     # Stage 2 — SplitPredictionModel (up-to-K-way)
     n_clusters: int = 5           # K: max fragments produced per split
@@ -311,18 +315,39 @@ def _plot_stability_table(exp: Ctx, lut: StabilityLookup) -> None:
 
     cfg = exp.cfg
     df_stable = pd.read_csv(cfg.csv_path)
-    grid = [(A, Z) for A in range(2, cfg.sc_a_max + 1) for Z in range(0, A + 1)]
-    stable = np.array([lut.is_stable(A, Z) for A, Z in grid], dtype=float)
-    g = np.array(grid, dtype=float)
+    a_max = cfg.sc_a_max
+    if a_max is None:
+        table_max = int(df_stable["A"].max())
+        a_max = int(np.ceil(table_max + max(0.10 * table_max, 5.0)))
+    # One cell per (A, Z) rather than a scatter point.  At HSE scale the grid is
+    # ~10k points, and overlapping s=30 markers merged into a solid block; the
+    # s=60 "table entries" overlay then covered the ~9% of cells that are green
+    # with larger black circles.  That overlay was also pure redundancy —
+    # is_stable() is true for exactly the table's (A, Z) pairs — so it hid the
+    # only signal in the figure while adding nothing.  Cells make each nucleus
+    # one pixel, which stays legible however heavy the table gets.
+    img = np.full((a_max + 1, a_max + 1), np.nan)   # NaN => unphysical Z > A
+    for A in range(2, a_max + 1):
+        for Z in range(0, A + 1):
+            img[Z, A] = 1.0 if lut.is_stable(A, Z) else 0.0
+
+    # Two flat colours read better than a continuous map for a binary field:
+    # pale grey for "known unstable", saturated green for "in the table".
+    cmap = ListedColormap(["#e8e8e8", "#1a9850"])
+    cmap.set_bad("white")                            # Z > A stays blank
 
     fig, ax = plt.subplots(figsize=(9, 6))
-    sc = ax.scatter(g[:, 0], g[:, 1], c=stable, cmap="RdYlGn",
-                    vmin=0, vmax=1, s=30, alpha=0.8)
-    ax.scatter(df_stable["A"], df_stable["Z"], s=60, edgecolors="k",
-               facecolors="none", lw=1.5, label="table entries")
-    fig.colorbar(sc, ax=ax, label="stable (lookup)")
+    ax.imshow(img, origin="lower", cmap=cmap, vmin=0, vmax=1,
+              interpolation="nearest", aspect="auto")
+    # Crop the empty Z > A wedge: the valley sits near Z ~ A/2, so plotting up
+    # to a_max wastes half the axes on blank space.
+    z_hi = int(np.ceil(df_stable["Z"].max() + max(0.10 * df_stable["Z"].max(), 5.0)))
+    ax.set_ylim(0, z_hi)
+    ax.set_xlim(0, a_max)
+    handles = [Patch(facecolor="#1a9850", label=f"in table ({len(df_stable)} nuclei)"),
+               Patch(facecolor="#e8e8e8", label="not in table")]
+    ax.legend(handles=handles, loc="upper left")
     ax.set(xlabel="A", ylabel="Z", title="Stability lookup table")
-    ax.legend()
     exp.save_fig(fig, "stability_table.png")
 
 
