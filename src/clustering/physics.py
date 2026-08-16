@@ -18,7 +18,7 @@ def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor):
     a_1 = 15.75  # MeV  volume
     a_2 = 17.80  # MeV  surface
     a_3 = 0.711  # MeV  Coulomb
-    a_4 = 23.70  # MeV  asymmetry  (NOTE: pairs with the (A/2 − Z)² form — see TODO.md)
+    a_4 = 23.70  # MeV  asymmetry  (pairs with the standard (A − 2Z)² form below)
     a_p = 34.0   # MeV  pairing
 
     assert (A > 0).all()
@@ -36,7 +36,11 @@ def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor):
         a_1 * A
         - a_2 * torch.pow(A, 2 / 3)
         - a_3 * Z**2 / torch.pow(A, 1 / 3)
-        - a_4 * (A / 2 - Z) ** 2 / A
+        # (A − 2Z)², not (A/2 − Z)².  They differ by a factor of 4, and 23.70 MeV is
+        # the literature coefficient for *this* form.  Paired with the halved form
+        # the penalty came out 4x too weak, Coulomb won, and the predicted valley
+        # slid neutron-rich — Z*(128) = 36 against 53 in the HSE nuclei table.
+        - a_4 * (A - 2 * Z) ** 2 / A
         + delta
     )
 
