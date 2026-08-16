@@ -214,17 +214,56 @@ def weizsacker_qmd_energy(
       B(A,Z) [MeV]), ``V`` = ``total_potential_energy`` (Σ over pairs [MeV]).
       Both are **extensive** (additive over disjoint fragments), so a split's
       reward is a genuine energy balance: ``V_parent − ΣV_child`` is exactly the
-      inter-fragment interaction the split breaks, and W's surface term makes
-      merging into fewer, larger nuclei favorable — both resist over-splitting.
+      inter-fragment interaction the split breaks.  The two terms pull in
+      *opposite* directions — W's surface term favors merging into fewer, larger
+      nuclei, while V rewards cutting the weak or mildly repulsive long-range
+      bonds between clusters.  W wins on cold matter (see below), so the pair
+      still resists over-splitting overall, but not for the reason the earlier
+      version of this note gave.
     - ``"per_nucleon"``: ``W`` = ``weizsacker_per_nucleon_formula`` (B/A),
       ``V`` = ``binding_energy`` (mean pairwise) — intensive / "affinity" scale.
       Kept for comparison; it washes out the extensive energy signal and tends to
       over-split into free nucleons (see the analysis in the branch history).
 
-    Note on sign: on the spectator data ``V`` is Pauli-repulsion-dominated and
-    **positive**, so "minimize QMD" means reducing repulsion between over-close
-    nucleons (which favors splitting) — the opposite pressure to W's merge bias;
-    ``qmd_weight`` tunes the balance.
+    Both W and V are in **MeV** — every QMD constant carries its units
+    (``t_1`` MeV·fm³, ``V_0_Yuk`` MeV·fm, ``e_sq`` MeV·fm, ``V_0_Pauli`` MeV) and
+    the Weizsäcker coefficients are MeV against dimensionless A and Z.  So
+    ``qmd_weight`` is a genuine physics weight, not a unit conversion.
+
+    **What each term does** (measured on 512 HSE SpectatorsLeft events, MST at
+    d_cut=2.0 against a random 6-way assignment).  Writing the reward as
+
+        q·N = V_cut + (ΣW_leaf − W_parent),   V_cut ≡ V_parent − ΣV_leaf
+
+    makes the two pressures explicit — ``V_cut`` is the summed pair potential of
+    the bonds the split breaks, and ΔW the binding gained or lost by reshaping
+    the mass into new fragments:
+
+                        V(parent)   V_cut      ΔW      q·N
+        MST d_cut=2.0    -1831.8    +68.9   -119.7    -50.7
+        random 6-way     -1831.8   -1522.8  -213.9  -1736.7
+
+    ``V(parent)`` is **negative**: the spectator source is bound.  ``V_cut`` is
+    *positive* for MST because MST cuts at 2–3 fm, where the pair potential is
+    mildly repulsive (+0.96 MeV at 2 fm), so severing those bonds releases
+    energy.  A random assignment instead tears through the attractive short-range
+    core and pays -1522.8 for it, which is why the reward separates physical
+    clustering from noise by more than an order of magnitude.
+
+    What resists fragmentation is therefore **W's surface term**, not the QMD
+    potential: more fragments means more total surface (Σ Aᵢ^⅔ > (ΣA)^⅔), so
+    ΔW = -119.7 outweighs V_cut = +68.9 and q·N stays negative.  That is correct
+    for *cold* matter — and it is why the global optimum of this reward is not to
+    split at all (q = 0 identically when the single leaf is the parent).  Real
+    multifragmentation is driven by excitation energy paying that surface cost,
+    and no E* term exists here yet.  See ``STABILITY_VALLEY_BRAINSTORM.md``.
+
+    HISTORY: this note used to read "V is Pauli-repulsion-dominated and positive,
+    so minimize-QMD favors splitting".  That was an accurate description of a
+    unit bug — momenta are stored in GeV/c while ``p_0`` is MeV/c, so the Pauli
+    term never switched off and the pair potential was positive at short range,
+    inverting the objective.  Fixed in the commit that rewrote this docstring;
+    every reward recorded before it is on the inverted scale.
 
     W is undefined for A < 2 (``weizsacker_formula`` asserts A > 0 and the
     liquid-drop picture is meaningless for a free nucleon), so W = 0 there; the
