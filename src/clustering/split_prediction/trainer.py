@@ -504,6 +504,18 @@ class KSplitTrainer:
         self.type_index = type_index
         self.min_fragment_size = min_fragment_size
 
+        # Per-optimizer-step log.  Epoch-level series are far too coarse once the
+        # dataset is large: 3 epochs over 58k events is 1,368 optimizer steps but
+        # only 3 plotted points for 3.5 h of compute.  Everything here is already
+        # computed per batch, so recording it costs nothing.  eval_reward stays
+        # epoch-level — it is a full-dataset pass and cannot run per step.
+        self.global_step = 0
+        self.epoch_end_steps: List[int] = []   # x-positions for the epoch-level series
+        self.step_history: Dict[str, List[float]] = {
+            "step": [], "loss": [], "reward": [], "q_weighted": [], "grad_norm": [],
+            "value_loss": [], "lr": [], "n_nodes": [], "node_depth": [], "valid_frac": [],
+        }
+
         # Per-node energy U(fragment); the split reward is q = (U_parent − ΣU_child)/N.
         #   "qmd_asym"       U = QMD potential + asymmetry penalty      (the main-branch reward)
         #   "weizsacker_qmd" U = qmd_weight·V − W  (maximize Weizsäcker W, minimize QMD V),
@@ -662,6 +674,28 @@ class KSplitTrainer:
                 all_rewards.extend(rewards.cpu().tolist())
             n += 1
 
+            # One record per optim.step().  `rewards` is None when the batch
+            # produced no scorable node at all — log NaN so the point is dropped
+            # from the plot rather than reading as a genuine zero.
+            self.global_step += 1
+            sh = self.step_history
+            sh["step"].append(float(self.global_step))
+            sh["loss"].append(loss)
+            sh["reward"].append(
+                float(rewards.mean().item()) if rewards is not None else float("nan"))
+            sh["q_weighted"].append(
+                stats["wq_sum"] / stats["wn_sum"] if stats["wn_sum"] else float("nan"))
+            sh["grad_norm"].append(grad_norm)
+            sh["value_loss"].append(value_loss)
+            sh["lr"].append(self.optim.param_groups[0]["lr"])
+            sh["n_nodes"].append(stats["n_nodes"])
+            sh["node_depth"].append(
+                stats["depth_sum"] / stats["n_valid_items"]
+                if stats["n_valid_items"] else float("nan"))
+            sh["valid_frac"].append(
+                stats["n_valid_items"] / stats["n_seen_items"]
+                if stats["n_seen_items"] else float("nan"))
+
         # One EMA update per epoch: baseline tracks epoch-mean reward,
         # so the plotted curve is as smooth as the epoch-average reward.
         # return_std tracks the spread, used to z-score the critic's target.
@@ -728,6 +762,7 @@ class KSplitTrainer:
         for ep in range(1, n_epochs + 1):
             lr = self.optim.param_groups[0]["lr"]  # LR used for this epoch
             avg_loss, avg_reward, avg_value_loss, avg_grad_norm, diag = self.train_epoch()
+            self.epoch_end_steps.append(self.global_step)  # anchor epoch series on the step axis
             eval_reward = self.eval_reward()
             if self.scheduler is not None:
                 self.scheduler.step()  # advance the LR schedule once per epoch

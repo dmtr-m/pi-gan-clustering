@@ -413,8 +413,9 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         print(f"Saved {exp.critic_model_path}")
 
     _track_split_history(exp, history)
-    _plot_split_history(exp, history)
-    _plot_grad_norm(exp, history)
+    _track_split_steps(exp, trainer.step_history)
+    _plot_split_history(exp, history, trainer.step_history, trainer.epoch_end_steps)
+    _plot_grad_norm(exp, history, trainer.step_history)
     return model
 
 
@@ -441,38 +442,112 @@ def _track_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
             exp.track(history["value_loss"][i], name="value_loss", step=epoch, context=ctx)
 
 
-def _plot_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
+def _track_split_steps(exp: Ctx, step_history: Dict[str, List[float]]) -> None:
+    """Log Stage-2 per-optimizer-step curves to Aim.
+
+    Same metric names as the epoch series but under ``context={"per": "step"}``, so
+    Aim keeps them as separate sequences rather than overwriting one with the other.
+    """
+    ctx = {"stage": "split", "per": "step"}
+    steps = step_history.get("step", [])
+    names = [n for n in step_history if n != "step"]
+    for i in range(len(steps)):
+        s = int(steps[i])
+        for name in names:
+            v = step_history[name][i]
+            if v == v:  # skip NaN (batch with no scorable node)
+                exp.track(v, name=name, step=s, context=ctx)
+
+
+def _rolling(y: List[float], w: int) -> np.ndarray:
+    """NaN-aware rolling mean, same length as ``y``."""
+    a = np.asarray(y, dtype=float)
+    if w <= 1 or len(a) < 2:
+        return a
+    out = np.full(len(a), np.nan)
+    for i in range(len(a)):
+        seg = a[max(0, i - w + 1): i + 1]
+        seg = seg[~np.isnan(seg)]
+        if len(seg):
+            out[i] = seg.mean()
+    return out
+
+
+def _plot_split_history(
+    exp: Ctx, history: Dict[str, List[float]],
+    step_history: Dict[str, List[float]] | None = None,
+    epoch_end_steps: List[int] | None = None,
+) -> None:
+    """Stage-2 curves on the optimizer-step axis.
+
+    Per-epoch points are far too few to read once the dataset is large (3 epochs
+    over 58k events = 3 points for 3.5 h of compute), so the step series is the
+    primary trace.  eval_reward is a full-dataset pass and stays per epoch; it is
+    drawn as markers anchored at the step where each epoch ended.
+    """
     cfg = exp.cfg
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    ax1.plot(history["eval_reward"], label="eval reward (argmax split)", color="C2")
-    ax1.plot(history["reward"], label="sampled reward", color="C0", alpha=0.5)
-    ax1.plot(history["baseline"], label="baseline (EMA)", linestyle="--", color="C1")
-    ax1.set(xlabel="Epoch", ylabel="Q [MeV/nucleon]",
+    sh = step_history or {}
+    x = sh.get("step") or list(range(1, len(history["reward"]) + 1))
+    per_step = bool(sh.get("step"))
+    xlabel = "Optimizer step" if per_step else "Epoch"
+    # Raw per-step curves are noisy; show them faintly under a rolling mean.
+    w = max(1, len(x) // 100)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
+    for key, color, label in (("q_weighted", "C3", "q_weighted (size-weighted)"),
+                              ("reward", "C0", "sampled reward (unweighted)")):
+        y = sh.get(key) or history.get(key, [])
+        if not y:
+            continue
+        ax1.plot(x, y, color=color, alpha=0.25, lw=0.7)
+        ax1.plot(x, _rolling(y, w), color=color, lw=1.6, label=label)
+    ex = epoch_end_steps if (per_step and epoch_end_steps) else list(range(1, len(history["eval_reward"]) + 1))
+    ax1.plot(ex, history["eval_reward"], color="C2", marker="o", ms=4,
+             lw=1.6, label="eval reward (argmax, per epoch)")
+    ax1.set(xlabel=xlabel, ylabel="Q [MeV/nucleon]",
             title=f"KSplitTrainer (K={cfg.n_clusters}) — QMD reward")
-    ax1.legend()
-    ax2.plot(history["loss"], label="policy loss")
-    if cfg.use_critic and any(history["value_loss"]):
+    ax1.legend(fontsize=8)
+
+    yl = sh.get("loss") or history["loss"]
+    ax2.plot(x, yl, color="C0", alpha=0.25, lw=0.7)
+    ax2.plot(x, _rolling(yl, w), color="C0", lw=1.6, label="policy loss")
+    vl = sh.get("value_loss") or history.get("value_loss", [])
+    if cfg.use_critic and any(v for v in vl if v == v):
         # On the z-scored target, value_loss ~= 1 means the critic is no better
         # than predicting the mean; -> 0 means it explains the reward.
-        ax2.plot(history["value_loss"], label="critic value loss", linestyle="--")
+        ax2.plot(x, _rolling(vl, w), color="C1", ls="--", lw=1.6, label="critic value loss")
         ax2.axhline(1.0, color="grey", lw=0.8, alpha=0.6)
-        ax2.legend()
-    ax2.set(xlabel="Epoch", ylabel="Loss", title=f"KSplitTrainer (K={cfg.n_clusters}) — Losses")
+    ax2.legend(fontsize=8)
+    ax2.set(xlabel=xlabel, ylabel="Loss", title=f"KSplitTrainer (K={cfg.n_clusters}) — Losses")
     exp.save_fig(fig, "split_history.png")
 
 
-def _plot_grad_norm(exp: Ctx, history: Dict[str, List[float]]) -> None:
-    """Actor gradient norm per epoch (measured before clipping).
+def _plot_grad_norm(
+    exp: Ctx, history: Dict[str, List[float]],
+    step_history: Dict[str, List[float]] | None = None,
+) -> None:
+    """Actor gradient norm per optimizer step (measured before clipping).
 
-    The clip threshold (1.0) is drawn for reference: points above it were clipped.
+    The configured clip threshold is drawn for reference: points above it were
+    clipped.  Per-step resolution matters here — the epoch mean hides the spikes
+    that clipping exists to suppress.
     """
-    gn = history.get("grad_norm", [])
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(gn, color="C3", marker=".", ms=4, label="‖grad‖ (actor, pre-clip)")
-    ax.axhline(1.0, color="grey", ls="--", lw=1, label="clip threshold (1.0)")
-    if gn and min(gn) > 0:
+    sh = step_history or {}
+    gn = sh.get("grad_norm") or history.get("grad_norm", [])
+    x = sh.get("step") or list(range(1, len(gn) + 1))
+    per_step = bool(sh.get("grad_norm"))
+    if not gn:
+        return
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(x, gn, color="C3", alpha=0.3, lw=0.7)
+    ax.plot(x, _rolling(gn, max(1, len(gn) // 100)), color="C3", lw=1.6,
+            label="‖grad‖ (actor, pre-clip)")
+    ax.axhline(exp.cfg.grad_clip, color="grey", ls="--", lw=1,
+               label=f"clip threshold ({exp.cfg.grad_clip:g})")
+    finite = [g for g in gn if g == g and g > 0]
+    if finite and min(finite) > 0:
         ax.set_yscale("log")
-    ax.set(xlabel="Epoch", ylabel="Gradient norm",
+    ax.set(xlabel="Optimizer step" if per_step else "Epoch", ylabel="Gradient norm",
            title="Actor gradient norm (before clipping)")
     ax.legend()
     exp.save_fig(fig, "grad_norm.png")
