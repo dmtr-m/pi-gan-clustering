@@ -158,10 +158,12 @@ class MSTPretrainer:
         self.global_step = 0
         self.epoch_end_steps: List[int] = []
         self.step_history: Dict[str, List[float]] = {
-            "step": [], "loss": [], "pair_acc": [], "grad_norm": [],
+            "step": [], "loss": [], "pair_acc": [], "grad_norm": [], "entropy_frac": [],
         }
 
-    def _step(self, x: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float]:
+    def _step(
+        self, x: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[float, float, float, float]:  # loss, pair_acc, grad_norm, entropy_frac
         self.model.train()
         self.optim.zero_grad()
 
@@ -170,7 +172,7 @@ class MSTPretrainer:
         if not valid.any():
             # NaN, not 0: a batch with no real pair should drop out of the plots
             # and the epoch mean rather than read as a genuine zero loss.
-            return float("nan"), float("nan"), float("nan")
+            return float("nan"), float("nan"), float("nan"), float("nan")
 
         attn = self.model.soft_assign(x, mask)               # (B, K, N)
         p_same = pair_probabilities(attn).clamp(1e-6, 1 - 1e-6)  # (B, N, N)
@@ -210,14 +212,21 @@ class MSTPretrainer:
         self.optim.step()
 
         acc = (((p_same > 0.5).float() == same).float() * vf).sum() / n_valid
-        return float(loss.item()), float(acc.item()), float(grad_norm)
+        # Slot-assignment entropy over real nucleons, normalized by log K so it is
+        # comparable across n_clusters.  1.0 = uniform (the model is not committing
+        # to any assignment); a collapse toward one slot drives it down.
+        with torch.no_grad():
+            per_nucleon = -(attn * (attn + 1e-9).log()).sum(dim=1)   # (B, N) over slots
+            ent = float((per_nucleon * mask.float()).sum() / mask.sum().clamp(min=1)
+                        / float(np.log(attn.shape[1])))
+        return float(loss.item()), float(acc.item()), float(grad_norm), ent
 
     def train(self, n_epochs: int, verbose: bool = True, log_every: int = 1) -> Dict[str, List[float]]:
         history: Dict[str, List[float]] = {"loss": [], "pair_acc": []}
         for ep in range(1, n_epochs + 1):
             losses, accs = [], []
             for batch in self.dataloader:
-                l, a, g = self._step(
+                l, a, g, h = self._step(
                     batch["x"].to(self.device), batch["mask"].to(self.device)
                 )
                 losses.append(l)
@@ -228,6 +237,7 @@ class MSTPretrainer:
                 sh["loss"].append(l)
                 sh["pair_acc"].append(a)
                 sh["grad_norm"].append(g)
+                sh["entropy_frac"].append(h)
             self.epoch_end_steps.append(self.global_step)
             # nanmean: skip batches that had no valid pair at all.
             history["loss"].append(float(np.nanmean(losses)))

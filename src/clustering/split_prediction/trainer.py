@@ -514,7 +514,11 @@ class KSplitTrainer:
         self.step_history: Dict[str, List[float]] = {
             "step": [], "loss": [], "reward": [], "q_weighted": [], "grad_norm": [],
             "value_loss": [], "lr": [], "n_nodes": [], "node_depth": [], "valid_frac": [],
+            "entropy": [], "entropy_frac": [],
         }
+        # log K — the entropy of a uniform policy, and the ceiling for `entropy`.
+        # `entropy_frac` normalizes by it so runs with different K compare directly.
+        self._log_k = float(np.log(model.n_clusters))
 
         # Per-node energy U(fragment); the split reward is q = (U_parent − ΣU_child)/N.
         #   "qmd_asym"       U = QMD potential + asymmetry penalty      (the main-branch reward)
@@ -572,6 +576,14 @@ class KSplitTrainer:
         depth_sum = 0.0  # Sigma depth, over valid pairs
         n_valid_items = 0
         n_seen_items = 0
+        # Policy entropy, free from the sampled log-probs.  H = E_{a~p}[-log p(a)],
+        # and log_prob is already Sigma_n log p(a_n) over the node, so the
+        # size-weighted mean per-nucleon entropy is just Sigma(-log_prob)/Sigma N —
+        # no second forward pass.  Valid only under sampling (train mode); the
+        # argmax path would give -log p(argmax), which is not an entropy.
+        # Worth watching: H near log(K) means the policy is barely committing to
+        # any assignment, and a sharp drop is how slot collapse announces itself.
+        ent_sum = 0.0
 
         for rec in iter_split_nodes(
             self.model, x, mask, self.k, self.min_fragment_size, self.type_index,
@@ -586,6 +598,7 @@ class KSplitTrainer:
             wq_sum += float((rec["q"][v] * _n).sum().item())
             wn_sum += float(_n.sum().item())
             depth_sum += float(rec["depth"]) * int(v.sum().item())
+            ent_sum += float(-rec["log_prob"][v].detach().sum().item())
 
             q = rec["q"][v]                  # (m,) detached, immediate local reward
             log_probs = rec["log_prob"][v]   # (m,) in graph
@@ -628,6 +641,7 @@ class KSplitTrainer:
             "wq_sum": wq_sum,
             "wn_sum": wn_sum,
             "depth_sum": depth_sum,
+            "ent_sum": ent_sum,
             "n_valid_items": float(n_valid_items),
             "n_seen_items": float(n_seen_items),
         }
@@ -658,7 +672,7 @@ class KSplitTrainer:
         total_grad_norm = 0.0
         all_rewards: List[float] = []
         agg = {"n_nodes": 0.0, "wq_sum": 0.0, "wn_sum": 0.0, "depth_sum": 0.0,
-               "n_valid_items": 0.0, "n_seen_items": 0.0}
+               "ent_sum": 0.0, "n_valid_items": 0.0, "n_seen_items": 0.0}
         n = 0
         for batch in self.dataloader:
             loss, rewards, value_loss, grad_norm, stats = self._step(
@@ -695,6 +709,9 @@ class KSplitTrainer:
             sh["valid_frac"].append(
                 stats["n_valid_items"] / stats["n_seen_items"]
                 if stats["n_seen_items"] else float("nan"))
+            _h = stats["ent_sum"] / stats["wn_sum"] if stats["wn_sum"] else float("nan")
+            sh["entropy"].append(_h)
+            sh["entropy_frac"].append(_h / self._log_k)
 
         # One EMA update per epoch: baseline tracks epoch-mean reward,
         # so the plotted curve is as smooth as the epoch-average reward.
@@ -722,6 +739,9 @@ class KSplitTrainer:
                            if agg["n_valid_items"] else 0.0),
             "valid_frac": (agg["n_valid_items"] / agg["n_seen_items"]
                            if agg["n_seen_items"] else 0.0),
+            "entropy": agg["ent_sum"] / agg["wn_sum"] if agg["wn_sum"] else 0.0,
+            "entropy_frac": ((agg["ent_sum"] / agg["wn_sum"]) / self._log_k
+                             if agg["wn_sum"] else 0.0),
         }
         return total_loss / n, avg_reward, total_value_loss / n, total_grad_norm / n, diag
 
@@ -758,6 +778,7 @@ class KSplitTrainer:
             "grad_norm": [], "lr": [],
             # Diagnostics for the falling-`reward` question — see _step.
             "q_weighted": [], "n_nodes": [], "node_depth": [], "valid_frac": [],
+            "entropy": [], "entropy_frac": [],
         }
         for ep in range(1, n_epochs + 1):
             lr = self.optim.param_groups[0]["lr"]  # LR used for this epoch
@@ -773,7 +794,8 @@ class KSplitTrainer:
             history["value_loss"].append(avg_value_loss)
             history["grad_norm"].append(avg_grad_norm)
             history["lr"].append(lr)
-            for key in ("q_weighted", "n_nodes", "node_depth", "valid_frac"):
+            for key in ("q_weighted", "n_nodes", "node_depth", "valid_frac",
+                        "entropy", "entropy_frac"):
                 history[key].append(diag[key])
             if verbose and ep % log_every == 0:
                 critic_msg = f"  v_loss={avg_value_loss:.3f}" if self.critic is not None else ""
@@ -788,6 +810,7 @@ class KSplitTrainer:
                     f"  nodes={diag['n_nodes']:.1f}"
                     f"  depth={diag['node_depth']:.2f}"
                     f"  valid={diag['valid_frac']:.2f}"
+                    f"  H={diag['entropy']:.3f}/{self._log_k:.3f}"
                     f"  lr={lr:.2e}"
                     f"{critic_msg}"
                 )

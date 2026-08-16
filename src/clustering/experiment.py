@@ -443,7 +443,8 @@ def _track_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
         # Diagnostics for the falling-`reward` question: q_weighted is the
         # size-weighted twin of `reward`, and n_nodes/node_depth show whether the
         # node population is shifting underneath that unweighted mean.
-        for name in ("q_weighted", "n_nodes", "node_depth", "valid_frac"):
+        for name in ("q_weighted", "n_nodes", "node_depth", "valid_frac",
+                     "entropy", "entropy_frac"):
             if name in history:
                 exp.track(history[name][i], name=name, step=epoch, context=ctx)
         if use_critic:
@@ -463,7 +464,8 @@ def _track_mst_history(
     ctx_s = {"stage": "pretrain", "per": "step"}
     for i, s in enumerate(sh.get("step", [])):
         for key, name in (("loss", "mst_loss"), ("pair_acc", "mst_pair_acc"),
-                          ("grad_norm", "mst_grad_norm")):
+                          ("grad_norm", "mst_grad_norm"),
+                          ("entropy_frac", "mst_entropy_frac")):
             v = sh[key][i]
             if v == v:  # skip NaN (batch with no valid pair)
                 exp.track(v, name=name, step=int(s), context=ctx_s)
@@ -492,7 +494,12 @@ def _plot_mst_history(
     ax2 = ax.twinx()
     ax2.plot(x, acc, color="C2", alpha=0.25, lw=0.7)
     ax2.plot(x, _rolling(acc, w), color="C2", lw=1.6, label="pair accuracy")
-    ax2.set_ylabel("Pair accuracy")
+    # Normalized slot entropy shares the 0–1 axis: 1.0 = uniform assignment.
+    hf = sh.get("entropy_frac", [])
+    if any(v == v for v in hf):
+        ax2.plot(x, _rolling(hf, w), color="C4", lw=1.4, ls=":", label="slot entropy / log K")
+    ax2.set_ylabel("Pair accuracy  /  normalized entropy")
+    ax2.set_ylim(0, 1.05)
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="center right")
@@ -550,7 +557,7 @@ def _plot_split_history(
     # Raw per-step curves are noisy; show them faintly under a rolling mean.
     w = max(1, len(x) // 100)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 4.5))
     for key, color, label in (("q_weighted", "C3", "q_weighted (size-weighted)"),
                               ("reward", "C0", "sampled reward (unweighted)")):
         y = sh.get(key) or history.get(key, [])
@@ -576,6 +583,20 @@ def _plot_split_history(
         ax2.axhline(1.0, color="grey", lw=0.8, alpha=0.6)
     ax2.legend(fontsize=8)
     ax2.set(xlabel=xlabel, ylabel="Loss", title=f"KSplitTrainer (K={cfg.n_clusters}) — Losses")
+
+    # Policy entropy.  At log(K) the policy is uniform — it has not committed to
+    # any assignment and there is nothing to deploy; a sharp fall is how slot
+    # collapse (one slot taking every nucleon) shows up while reward looks fine.
+    he = sh.get("entropy") or history.get("entropy", [])
+    if any(v == v for v in he):
+        log_k = float(np.log(cfg.n_clusters))
+        ax3.plot(x, he, color="C4", alpha=0.25, lw=0.7)
+        ax3.plot(x, _rolling(he, w), color="C4", lw=1.6, label="policy entropy H")
+        ax3.axhline(log_k, color="grey", ls="--", lw=1, label=f"uniform = log K = {log_k:.2f}")
+        ax3.set_ylim(0, log_k * 1.08)
+        ax3.legend(fontsize=8)
+    ax3.set(xlabel=xlabel, ylabel="H [nats]",
+            title=f"KSplitTrainer (K={cfg.n_clusters}) — Policy entropy")
     exp.save_fig(fig, "split_history.png")
 
 
