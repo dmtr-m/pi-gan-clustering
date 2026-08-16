@@ -370,13 +370,21 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
     # model that structure up front and cuts seed-to-seed variance ~8x.
     if cfg.pretrain_epochs > 0:
         print(f"--- MST warm-start ({cfg.pretrain_epochs} epochs, d_cut={cfg.mst_d_cut} fm) ---")
-        MSTPretrainer(
+        pretrainer = MSTPretrainer(
             model,
             loader,
             optimizer=optim.AdamW(model.parameters(), lr=cfg.pretrain_lr),
             device=cfg.device,
             d_cut=cfg.mst_d_cut,
-        ).train(n_epochs=cfg.pretrain_epochs, log_every=max(1, cfg.pretrain_epochs // 5))
+        )
+        mst_history = pretrainer.train(
+            n_epochs=cfg.pretrain_epochs, log_every=max(1, cfg.pretrain_epochs // 5)
+        )
+        # Previously the returned history was discarded outright: the warm-start
+        # had no Aim series and no figure, only the printed lines.
+        _track_mst_history(exp, mst_history, pretrainer.step_history)
+        _plot_mst_history(exp, mst_history, pretrainer.step_history,
+                          pretrainer.epoch_end_steps)
 
     # Actor-Critic: the critic's parameters must share the optimizer with the actor.
     critic = (
@@ -440,6 +448,55 @@ def _track_split_history(exp: Ctx, history: Dict[str, List[float]]) -> None:
                 exp.track(history[name][i], name=name, step=epoch, context=ctx)
         if use_critic:
             exp.track(history["value_loss"][i], name="value_loss", step=epoch, context=ctx)
+
+
+def _track_mst_history(
+    exp: Ctx, history: Dict[str, List[float]],
+    step_history: Dict[str, List[float]] | None = None,
+) -> None:
+    """Log the MST warm-start to Aim, per epoch and per optimizer step."""
+    ctx = {"stage": "pretrain"}
+    for i in range(len(history.get("loss", []))):
+        exp.track(history["loss"][i], name="mst_loss", step=i + 1, context=ctx)
+        exp.track(history["pair_acc"][i], name="mst_pair_acc", step=i + 1, context=ctx)
+    sh = step_history or {}
+    ctx_s = {"stage": "pretrain", "per": "step"}
+    for i, s in enumerate(sh.get("step", [])):
+        for key, name in (("loss", "mst_loss"), ("pair_acc", "mst_pair_acc"),
+                          ("grad_norm", "mst_grad_norm")):
+            v = sh[key][i]
+            if v == v:  # skip NaN (batch with no valid pair)
+                exp.track(v, name=name, step=int(s), context=ctx_s)
+
+
+def _plot_mst_history(
+    exp: Ctx, history: Dict[str, List[float]],
+    step_history: Dict[str, List[float]] | None = None,
+    epoch_end_steps: List[int] | None = None,
+) -> None:
+    """MST warm-start curves on the optimizer-step axis."""
+    sh = step_history or {}
+    x = sh.get("step") or list(range(1, len(history.get("loss", [])) + 1))
+    per_step = bool(sh.get("step"))
+    if not x:
+        return
+    w = max(1, len(x) // 100)
+    loss = sh.get("loss") or history["loss"]
+    acc = sh.get("pair_acc") or history["pair_acc"]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, loss, color="C0", alpha=0.25, lw=0.7)
+    ax.plot(x, _rolling(loss, w), color="C0", lw=1.6, label="pair BCE loss")
+    ax.set(xlabel="Optimizer step" if per_step else "Epoch", ylabel="Loss",
+           title=f"MST warm-start (d_cut={exp.cfg.mst_d_cut} fm)")
+    ax2 = ax.twinx()
+    ax2.plot(x, acc, color="C2", alpha=0.25, lw=0.7)
+    ax2.plot(x, _rolling(acc, w), color="C2", lw=1.6, label="pair accuracy")
+    ax2.set_ylabel("Pair accuracy")
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="center right")
+    exp.save_fig(fig, "mst_history.png")
 
 
 def _track_split_steps(exp: Ctx, step_history: Dict[str, List[float]]) -> None:

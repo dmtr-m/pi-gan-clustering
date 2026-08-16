@@ -152,6 +152,15 @@ class MSTPretrainer:
         self.balance_classes = balance_classes
         self.grad_clip = grad_clip
 
+        # Per-optimizer-step log, mirroring KSplitTrainer.  Epoch resolution is
+        # useless at scale: 2 epochs over 58k events is 912 optimizer steps but
+        # only 2 points.  Everything here is already computed per batch.
+        self.global_step = 0
+        self.epoch_end_steps: List[int] = []
+        self.step_history: Dict[str, List[float]] = {
+            "step": [], "loss": [], "pair_acc": [], "grad_norm": [],
+        }
+
     def _step(self, x: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float]:
         self.model.train()
         self.optim.zero_grad()
@@ -159,7 +168,9 @@ class MSTPretrainer:
         labels = mst_clusters(x, mask, self.d_cut, self.p_cut, self.use_momentum)
         same, valid = pair_targets(labels, mask)
         if not valid.any():
-            return 0.0, 0.0
+            # NaN, not 0: a batch with no real pair should drop out of the plots
+            # and the epoch mean rather than read as a genuine zero loss.
+            return float("nan"), float("nan"), float("nan")
 
         attn = self.model.soft_assign(x, mask)               # (B, K, N)
         p_same = pair_probabilities(attn).clamp(1e-6, 1 - 1e-6)  # (B, N, N)
@@ -194,24 +205,33 @@ class MSTPretrainer:
         # `sum` / n_valid reproduces BCE's weighted `mean` over the valid pairs.
         loss = F.binary_cross_entropy(p_same, same, weight=w, reduction="sum") / n_valid
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        # clip_grad_norm_ returns the total norm *before* clipping — free diagnostic.
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optim.step()
 
         acc = (((p_same > 0.5).float() == same).float() * vf).sum() / n_valid
-        return float(loss.item()), float(acc.item())
+        return float(loss.item()), float(acc.item()), float(grad_norm)
 
     def train(self, n_epochs: int, verbose: bool = True, log_every: int = 1) -> Dict[str, List[float]]:
         history: Dict[str, List[float]] = {"loss": [], "pair_acc": []}
         for ep in range(1, n_epochs + 1):
             losses, accs = [], []
             for batch in self.dataloader:
-                l, a = self._step(
+                l, a, g = self._step(
                     batch["x"].to(self.device), batch["mask"].to(self.device)
                 )
                 losses.append(l)
                 accs.append(a)
-            history["loss"].append(float(np.mean(losses)))
-            history["pair_acc"].append(float(np.mean(accs)))
+                self.global_step += 1
+                sh = self.step_history
+                sh["step"].append(float(self.global_step))
+                sh["loss"].append(l)
+                sh["pair_acc"].append(a)
+                sh["grad_norm"].append(g)
+            self.epoch_end_steps.append(self.global_step)
+            # nanmean: skip batches that had no valid pair at all.
+            history["loss"].append(float(np.nanmean(losses)))
+            history["pair_acc"].append(float(np.nanmean(accs)))
             if verbose and ep % log_every == 0:
                 print(
                     f"[MST] {ep:4d}/{n_epochs}  "
