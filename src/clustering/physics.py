@@ -95,6 +95,14 @@ p_0 = 120  # MeV / c
 planck_constant = 197.3269804  # MeV * fm  (ℏc)
 e_sq = 1.4399644  # MeV * fm  (e² / 4πε₀ in natural units)
 
+# The parquet files store momenta and energies in GeV/c and GeV (fE spans
+# 0.94–3.83), while every constant here is MeV-based and coordinates are in fm.
+# Only the Pauli term reads momenta — Skyrme and Yukawa use coordinates alone and
+# Coulomb is e_sq [MeV*fm] / r [fm] — so this conversion is applied there and
+# nowhere else.  The Lorentz boosts are unaffected either way: they use β = p/E,
+# which is dimensionless as long as p and E share a unit.
+MOMENTUM_TO_MEV = 1000.0  # GeV/c (as stored) -> MeV/c (as p_0 expects)
+
 
 def binding_energy(
     nucleons: torch.Tensor,
@@ -259,9 +267,23 @@ def _caclulate_pauli_potential(
     coords_pairwise_boosted: torch.Tensor,     # (B, N, N, 3)
     particle_type_equality_matrix: torch.Tensor,  # (B, N, N)
 ) -> torch.Tensor:
-    """Pauli potential (eq. 3.15), evaluated in the CM frame of each pair."""
+    """Pauli potential (eq. 3.15), evaluated in the CM frame of each pair.
+
+    ``p_0`` is in MeV/c and the prefactor ``(ℏc / (q_0·p_0))³`` is dimensionless
+    only in that unit, so the momentum difference must be converted from the
+    GeV/c the dataset stores.  Without the conversion Δp² is ~10⁶ times too small
+    against ``2·p_0²``, the momentum Gaussian never leaves 1, and the Pauli
+    repulsion stays switched on for *every* same-isospin pair.  It then swamps
+    the Yukawa attraction at all separations (+28 MeV at 1 fm), which inverts the
+    sign of the pair potential at short range — and with it the split reward,
+    which is driven by the potential of the bonds a split breaks.  Measured
+    consequence: a random partition scored 7x better than MST cluster
+    recognition, and an untrained network beat every trained one.
+    """
     diff_r = coords_pairwise_boosted - coords_pairwise_boosted.transpose(1, 2)   # (B, N, N, 3)
-    diff_p = momenta_pairwise_boosted - momenta_pairwise_boosted.transpose(1, 2)  # (B, N, N, 3)
+    diff_p = (
+        momenta_pairwise_boosted - momenta_pairwise_boosted.transpose(1, 2)
+    ) * MOMENTUM_TO_MEV  # (B, N, N, 3)
 
     dist_r_sq = (diff_r ** 2).sum(dim=-1)  # (B, N, N)
     dist_p_sq = (diff_p ** 2).sum(dim=-1)  # (B, N, N)
