@@ -9,6 +9,7 @@ Pipeline
   Stage 1  build the stability lookup table from the known-nuclei CSV (diagnostic)
   Stage 2  train the up-to-K-way SplitPredictionModel (REINFORCE) -> dm_model.pt
   Stage 3  run FragmentsIdentifier and plot fragment distributions
+  Stage 4  classical MST + stability-decay baseline, same plots (no training)
 
 The stability oracle is a table lookup (no training, no sc_model.pt); Stage 3
 reads the CSV directly, so Stage 1 is purely a diagnostic and is not a
@@ -31,6 +32,7 @@ Examples
   clustering-run stages=[2,3] n_clusters=4 split_epochs=120
   clustering-run +experiment=quick            # tiny smoke test
   clustering-run stages=[3] load_split_from=/path/to/prev_run   # viz an old checkpoint
+  clustering-run stages=[4]                   # classical baseline only, no checkpoint
   clustering-run --multirun split_lr=1e-4,3e-4,1e-3             # sweep, one Aim run each
 """
 from __future__ import annotations
@@ -58,6 +60,7 @@ from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
+from clustering.baselines.mst_decay import BaselineResult, MSTDecayBaseline
 from clustering.split_prediction.dataset import NucleonDataset, collate_fn
 from clustering.split_prediction.model import SplitPredictionModel, SplitValueCritic
 from clustering.split_prediction.mst import MSTPretrainer
@@ -140,7 +143,7 @@ class ClusteringConfig:
     computed at runtime by ``Ctx`` — see ``main``.
     """
 
-    # Which of the 3 pipeline stages to run.
+    # Which pipeline stages to run (4 = classical baseline, off by default).
     stages: List[int] = field(default_factory=lambda: [1, 2, 3])
 
     # RNG seed. None -> a fresh random seed is drawn each run and recorded in the
@@ -230,6 +233,24 @@ class ClusteringConfig:
     n_vis: int = 200
     force_split: bool = False     # True bypasses the stability lookup
 
+    # Stage 4 — classical baseline: MST cluster recognition + decay onto the
+    # nuclei table.  Nothing is trained and no checkpoint is read, so
+    # `stages=[4]` runs standalone and fixes the scale for every Stage-3
+    # observable.  Uses n_vis events per spectator side, like Stage 3.
+    #   baseline_use_momentum: MSTp (relative-momentum cut) vs coordinate-only MST.
+    #   baseline_p_frame: "pair_cm" (boost to the pair rest frame) or "lab".
+    #   baseline_decay: False emits the primary fragments untouched, which is the
+    #     ablation that isolates what the decay stage contributes.
+    #   baseline_emit_rule: which nucleon of the chosen species evaporates —
+    #     "hottest" (max kinetic energy in the fragment rest frame), "outermost",
+    #     or "first".
+    baseline_d_cut: float = 2.0
+    baseline_use_momentum: bool = True
+    baseline_p_cut: float = 250.0
+    baseline_p_frame: str = "pair_cm"
+    baseline_decay: bool = True
+    baseline_emit_rule: str = "hottest"
+
     type_index: int = 7
     input_dim: int = 8
 
@@ -253,6 +274,10 @@ class Ctx:
         self.cfg = cfg
         self.out_dir = Path(out_dir)
         self.run = run
+        # Prefix for every figure written while it is set, so Stage 3 and the
+        # Stage 4 baseline can reuse the same _plot_* functions without
+        # overwriting each other's files.
+        self.fig_prefix = ""
 
     @property
     def dm_model_path(self) -> Path:
@@ -274,6 +299,7 @@ class Ctx:
 
     def save_fig(self, fig: plt.Figure, name: str) -> None:
         fig.tight_layout()
+        name = f"{self.fig_prefix}{name}"
         path = self.fig_dir / name
         fig.savefig(path, dpi=120)
         # Logging figures to Aim is nice-to-have; never let it break a run.
@@ -673,9 +699,69 @@ def build_identifier(exp: Ctx) -> FragmentsIdentifier:
 
 
 def visualize_fragments(exp: Ctx) -> None:
-    cfg = exp.cfg
     print("\n=== Stage 3 — Fragment identification & visualization ===")
     fi = build_identifier(exp)
+    with torch.no_grad():
+        _fragment_report(exp, fi, stage="fragments")
+
+
+def run_baseline(exp: Ctx) -> None:
+    """Stage 4 — MST (+ stability decay) baseline over the same events as Stage 3."""
+    cfg = exp.cfg
+    print("\n=== Stage 4 — MST baseline"
+          f"{' + stability decay' if cfg.baseline_decay else ' (primaries only)'} ===")
+    lut = StabilityLookup(cfg.csv_path)
+    mode = "MSTp" if cfg.baseline_use_momentum else "MST"
+    print(f"{mode}: d_cut={cfg.baseline_d_cut} fm"
+          + (f", p_cut={cfg.baseline_p_cut} MeV/c ({cfg.baseline_p_frame})"
+             if cfg.baseline_use_momentum else "")
+          + f"; table: {len(lut)} nuclei")
+    baseline = MSTDecayBaseline(
+        lut,
+        d_cut=cfg.baseline_d_cut,
+        p_cut=cfg.baseline_p_cut,
+        use_momentum=cfg.baseline_use_momentum,
+        p_frame=cfg.baseline_p_frame,
+        decay=cfg.baseline_decay,
+        emit_rule=cfg.baseline_emit_rule,
+        type_index=cfg.type_index,
+    )
+    tally = {"n_primary": 0, "n_primary_in_table": 0, "n_evaporated": 0}
+
+    def fragment_fn(event: torch.Tensor) -> BaselineResult:
+        # The baseline is numpy/scipy-bound; keep it on the CPU regardless of
+        # cfg.device, which only ever helped the neural path.
+        res = baseline(event.cpu())
+        for k in tally:
+            tally[k] += getattr(res, k)
+        return res
+
+    exp.fig_prefix = "baseline_"
+    try:
+        _fragment_report(exp, fragment_fn, stage="baseline")
+    finally:
+        exp.fig_prefix = ""
+
+    frac_known = tally["n_primary_in_table"] / max(1, tally["n_primary"])
+    print(f"Primary fragments: {tally['n_primary']}  "
+          f"(known nuclei: {tally['n_primary_in_table']}, {frac_known:.1%})")
+    print(f"Nucleons evaporated by the decay stage: {tally['n_evaporated']}")
+    ctx = {"stage": "baseline"}
+    exp.track(tally["n_primary"], name="primary_fragments", context=ctx)
+    exp.track(tally["n_primary_in_table"], name="primary_fragments_in_table", context=ctx)
+    exp.track(frac_known, name="primary_in_table_frac", context=ctx)
+    exp.track(tally["n_evaporated"], name="evaporated_nucleons", context=ctx)
+
+
+def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
+    """Run a fragmenter over the visualization events and plot the result.
+
+    ``fragment_fn(event) -> result`` where ``result`` carries ``.fragments``
+    (list of ``(n_i, 8)`` tensors) and ``.split_depths``.  Both
+    ``FragmentsIdentifier`` and ``MSTDecayBaseline`` satisfy that, so the learned
+    and classical paths produce byte-for-byte comparable reports.
+    """
+    cfg = exp.cfg
 
     vis_datasets = {
         "SpectatorsLeft": NucleonDataset(cfg.data_path, particle_type="SpectatorsLeft"),
@@ -722,8 +808,7 @@ def visualize_fragments(exp: Ctx) -> None:
             ev_pn_ratio.append(z_in / n_neutrons if n_neutrons > 0 else np.nan)
             ev_nucleon_pt.append(float(np.hypot(p[:, 0], p[:, 1]).mean()))
 
-            with torch.no_grad():
-                result = fi(event)
+            result = fragment_fn(event)
 
             n_frags_per_event.append(len(result.fragments))
             split_depths.extend(result.split_depths)
@@ -779,7 +864,7 @@ def visualize_fragments(exp: Ctx) -> None:
     print(f"Splits total     : {len(split_depths_arr)}  (max tree level: {max_level})")
 
     # Stage-3 summary scalars -> Aim (single values, context stage=fragments).
-    frag_ctx = {"stage": "fragments"}
+    frag_ctx = {"stage": stage}
     exp.track(n_events_seen, name="events", context=frag_ctx)
     exp.track(n_frag_total, name="fragments_total", context=frag_ctx)
     exp.track(n_a1, name="fragments_A1", context=frag_ctx)
@@ -792,7 +877,9 @@ def visualize_fragments(exp: Ctx) -> None:
     exp.track(float(np.nanmean(ev_max_z)), name="max_charge_mean", context=frag_ctx)
 
     _plot_n_fragments(exp, n_frags_arr)
-    _plot_splits_per_level(exp, split_depths_arr)
+    # The baseline performs no tree splits, so this plot would be an empty axes.
+    if len(split_depths_arr):
+        _plot_splits_per_level(exp, split_depths_arr)
     _plot_eta(exp, np.array(nucleon_eta), np.array(nuclei_eta))
     _plot_az_nz(exp, nuclei_A_arr, nuclei_Z_arr, nuclei_N_arr)
 
@@ -985,6 +1072,8 @@ def run(exp: Ctx) -> None:
         train_split_model(exp, dataset)
     if 3 in stages:
         visualize_fragments(exp)
+    if 4 in stages:
+        run_baseline(exp)
 
 
 # Register the structured schema at import time so it is available whether the
