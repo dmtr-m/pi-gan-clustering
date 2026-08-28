@@ -876,6 +876,8 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
     exp.track(max_level, name="max_tree_level", context=frag_ctx)
     exp.track(float(np.nanmean(ev_max_z)), name="max_charge_mean", context=frag_ctx)
 
+    _dump_fragment_yields(exp, nuclei_A_arr, nuclei_Z_arr, n_events_seen)
+
     _plot_n_fragments(exp, n_frags_arr)
     # The baseline performs no tree splits, so this plot would be an empty axes.
     if len(split_depths_arr):
@@ -891,6 +893,27 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
     _plot_max_charge(exp, np.array(ev_max_z))
     _plot_n_nucleons(exp, np.array(ev_n_nucleons))
     _plot_pn_ratio(exp, np.array(ev_pn_ratio))
+
+
+def _dump_fragment_yields(exp: Ctx, A: np.ndarray, Z: np.ndarray,
+                          n_events: int) -> None:
+    """Write the (A, Z) yield table as CSV next to the figures.
+
+    Comparing two log-scale heatmaps by eye cannot settle how far a produced
+    distribution is from the generator's — a point `SESSION_SUMMARY.md` lists as
+    still unmeasured.  ``yield_per_event`` is the same normalization the
+    generator's own reference plot uses, so the two are directly subtractable
+    once mcini exports its numbers.
+    """
+    pairs, counts = np.unique(np.stack([A, Z], axis=1), axis=0, return_counts=True)
+    order = np.lexsort((pairs[:, 1], pairs[:, 0]))
+    name = f"{exp.fig_prefix}fragment_yields.csv"
+    path = exp.out_dir / name
+    lines = ["A,Z,count,yield_per_event"]
+    lines += [f"{pairs[i, 0]},{pairs[i, 1]},{counts[i]},{counts[i] / max(1, n_events):.6g}"
+              for i in order]
+    path.write_text("\n".join(lines) + "\n")
+    print(f"Saved {path}  ({len(order)} species)")
 
 
 def _plot_splits_per_level(exp: Ctx, split_depths: np.ndarray) -> None:
