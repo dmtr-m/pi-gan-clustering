@@ -12,6 +12,13 @@ the same pre-fragment if they lie within ``d_cut`` in coordinate space.  The
 momentum-extended variant (MSTp) additionally requires their relative momentum
 to be below ``p_cut``.  Fragments are the connected components of that graph.
 
+Relative momentum is evaluated in the rest frame of the *pair* by default
+(``p_frame="pair_cm"``): the source here is a spectator remnant carrying ~1.1
+GeV/c per nucleon in the lab, and a boost stretches longitudinal momentum
+differences by gamma ~ 1.5, so a lab-frame |dp| is not the quantity the p_cut
+literature value refers to.  Measured on HSE SpectatorsLeft pairs within 2 fm:
+median |dp| is 331 MeV/c in the lab against 280 MeV/c in the pair CM.
+
 Refs: arXiv:1009.5452, arXiv:1706.01300.
 """
 from typing import Dict, List, Tuple
@@ -24,6 +31,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from torch.utils.data import DataLoader
 
+from clustering.physics import MOMENTUM_TO_MEV, _pairwise_lorentz_boost
 from clustering.split_prediction.model import SplitPredictionModel
 
 # Cluster-recognition cuts.
@@ -45,9 +53,56 @@ from clustering.split_prediction.model import SplitPredictionModel
 # main benefit is reliability — it cuts seed-to-seed std ~8x (±0.23 vs ±1.82).
 D_CUT = 2.0    # fm
 P_CUT = 250.0  # MeV/c
-# NB: on spectator matter the momentum cut is inactive — nucleons within d_cut
-# are co-moving, so every such pair already satisfies |Δp| < 250 MeV/c and MSTp
-# gives labels identical to coordinate-only MST.
+P_FRAME = "pair_cm"   # frame the relative momentum is measured in: "pair_cm" | "lab"
+
+# `use_momentum` defaults to **False**, i.e. coordinate-only MST.
+#
+# It used to default to True with this note attached: "on spectator matter the
+# momentum cut is inactive — nucleons within d_cut are co-moving, so every such
+# pair already satisfies |Δp| < 250 MeV/c and MSTp gives labels identical to
+# coordinate-only MST".  That was a description of a unit bug, not of the
+# physics: the parquet stores momenta in **GeV/c** and this cut is in **MeV/c**,
+# so `cdist(p) < 250` was comparing ~0.3 against 250 and was true for every pair
+# on the grid.  Same class of bug as the Pauli potential (commit aa657d6).
+#
+# With the conversion applied, the cut is very much active — measured on HSE
+# SpectatorsLeft, over pairs already within d_cut = 2 fm:
+#     p_cut [MeV/c]   100    150    200    250    300    400
+#     frac kept       0.045  0.121  0.241  0.399  0.567  0.846
+# so MSTp at the literature 250 MeV/c would drop ~60% of the spatial bonds.
+#
+# Every MST warm-start run to date therefore used coordinate-only labels, and
+# the d_cut percolation scan documented above was measured that way.  Keeping
+# use_momentum=False preserves that behaviour exactly; MSTp is now opt-in with a
+# cut that actually fires.
+
+
+@torch.no_grad()
+def relative_momenta(
+    nucleons: torch.Tensor,   # (N, 8) one fragment / event, no padding
+    frame: str = P_FRAME,
+) -> torch.Tensor:
+    """Pairwise relative momentum |p_i - p_j| in **MeV/c**.  Returns (N, N).
+
+    ``frame``:
+      - ``"pair_cm"``: both momenta are Lorentz-boosted into the rest frame of
+        the pair first (the same boost the QMD Pauli term uses).  In that frame
+        p_i' = -p_j', so this returns 2|p*| — the same quantity the lab-frame
+        expression means to measure, without the beam boost folded in.
+      - ``"lab"``: the raw difference as stored.
+
+    The dataset stores momenta in GeV/c; the conversion to MeV/c happens here, so
+    every caller compares against ``p_cut`` in the unit the literature quotes.
+    """
+    p = nucleons[..., 0:3]
+    if frame == "lab":
+        return torch.cdist(p, p) * MOMENTUM_TO_MEV
+    if frame != "pair_cm":
+        raise ValueError(f"unknown frame {frame!r}; expected 'pair_cm' or 'lab'")
+    p_boosted, _ = _pairwise_lorentz_boost(
+        p.unsqueeze(0), nucleons[..., 3].unsqueeze(0), nucleons[..., 4:7].unsqueeze(0)
+    )  # (1, N, N, 3)
+    return (p_boosted - p_boosted.transpose(1, 2)).norm(dim=-1)[0] * MOMENTUM_TO_MEV
 
 
 @torch.no_grad()
@@ -56,9 +111,14 @@ def mst_clusters(
     mask: torch.Tensor,     # (B, N)  True = real nucleon
     d_cut: float = D_CUT,
     p_cut: float = P_CUT,
-    use_momentum: bool = True,
+    use_momentum: bool = False,
+    p_frame: str = P_FRAME,
 ) -> torch.Tensor:
     """MST / MSTp cluster labels.
+
+    Two nucleons are linked when they are within ``d_cut`` [fm] and — with
+    ``use_momentum`` — within ``p_cut`` [MeV/c] of relative momentum.  See the
+    note above ``D_CUT`` for why ``use_momentum`` defaults to False.
 
     Returns:
         labels (B, N) int64 — connected-component id per nucleon, ``-1`` for
@@ -68,7 +128,6 @@ def mst_clusters(
     B, N, _ = x.shape
     labels = torch.full((B, N), -1, dtype=torch.long, device=x.device)
     r = x[..., 4:7]
-    p = x[..., 0:3]
 
     for b in range(B):
         idx = torch.nonzero(mask[b]).flatten()
@@ -77,7 +136,7 @@ def mst_clusters(
         rr = r[b, idx]
         adj = torch.cdist(rr, rr) < d_cut
         if use_momentum:
-            adj = adj & (torch.cdist(p[b, idx], p[b, idx]) < p_cut)
+            adj = adj & (relative_momenta(x[b, idx], p_frame) < p_cut)
         adj = adj.clone()
         adj.fill_diagonal_(False)
         _, comp = connected_components(
@@ -138,7 +197,8 @@ class MSTPretrainer:
         device: str = "cpu",
         d_cut: float = D_CUT,
         p_cut: float = P_CUT,
-        use_momentum: bool = True,
+        use_momentum: bool = False,
+        p_frame: str = P_FRAME,
         balance_classes: bool = True,
         grad_clip: float = 1.0,
     ) -> None:
@@ -149,6 +209,7 @@ class MSTPretrainer:
         self.d_cut = d_cut
         self.p_cut = p_cut
         self.use_momentum = use_momentum
+        self.p_frame = p_frame
         self.balance_classes = balance_classes
         self.grad_clip = grad_clip
 
@@ -167,7 +228,8 @@ class MSTPretrainer:
         self.model.train()
         self.optim.zero_grad()
 
-        labels = mst_clusters(x, mask, self.d_cut, self.p_cut, self.use_momentum)
+        labels = mst_clusters(x, mask, self.d_cut, self.p_cut,
+                              self.use_momentum, self.p_frame)
         same, valid = pair_targets(labels, mask)
         if not valid.any():
             # NaN, not 0: a batch with no real pair should drop out of the plots
@@ -253,11 +315,12 @@ class MSTPretrainer:
 
 @torch.no_grad()
 def mst_stats(dataloader: DataLoader, d_cut: float = D_CUT, p_cut: float = P_CUT,
-              use_momentum: bool = True) -> Dict[str, float]:
+              use_momentum: bool = False, p_frame: str = P_FRAME) -> Dict[str, float]:
     """Fragment-multiplicity summary of the MST labelling (sanity check the cuts)."""
     n_frags, sizes = [], []
     for batch in dataloader:
-        labels = mst_clusters(batch["x"], batch["mask"], d_cut, p_cut, use_momentum)
+        labels = mst_clusters(batch["x"], batch["mask"], d_cut, p_cut,
+                              use_momentum, p_frame)
         for b in range(labels.shape[0]):
             lab = labels[b][batch["mask"][b]]
             if lab.numel() == 0:
