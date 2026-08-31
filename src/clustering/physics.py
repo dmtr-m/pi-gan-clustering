@@ -104,6 +104,47 @@ e_sq = 1.4399644  # MeV * fm  (e² / 4πε₀ in natural units)
 MOMENTUM_TO_MEV = 1000.0  # GeV/c (as stored) -> MeV/c (as p_0 expects)
 
 
+def pairwise_potential_matrix(
+    nucleons: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Pairwise QMD potential ``V_ij`` [MeV] for every real pair.  Returns (B, N, N).
+
+    Skyrme + Yukawa + Coulomb + Pauli, each evaluated in the rest frame of the
+    pair, with padding and the diagonal zeroed.  ``binding_energy`` and
+    ``total_potential_energy`` are sums over this matrix; SACA needs the matrix
+    itself, because its annealing moves change one nucleon's cluster membership
+    at a time and the energy change is then a row sum rather than a full
+    recomputation.
+    """
+    N = mask.shape[1]
+    off_diag = ~torch.eye(N, dtype=torch.bool, device=mask.device).unsqueeze(0)
+    mask_ij = mask.unsqueeze(2) & mask.unsqueeze(1) & off_diag  # (B, N, N)
+
+    momenta = nucleons[..., 0:3]
+    energies = nucleons[..., 3]
+    coords = nucleons[..., 4:7]
+    types = nucleons[..., 7]
+
+    momenta_pairwise_boosted, coords_pairwise_boosted = _pairwise_lorentz_boost(
+        momenta, energies, coords
+    )
+    same_type_matrix = (types.unsqueeze(2) == types.unsqueeze(1)).float()
+    proton_proton_mask = (
+        (types == 1).unsqueeze(2) & (types == 1).unsqueeze(1)
+    ).float()
+
+    pairwise = (
+        _calculate_skyrme_potential(coords_pairwise_boosted)
+        + _calculate_yukawa_potential(coords_pairwise_boosted)
+        + _caclulate_coulomb_potential(coords_pairwise_boosted, proton_proton_mask)
+        + _caclulate_pauli_potential(
+            momenta_pairwise_boosted, coords_pairwise_boosted, same_type_matrix
+        )
+    )
+    return pairwise * mask_ij.float()
+
+
 def binding_energy(
     nucleons: torch.Tensor,
     mask: torch.Tensor,

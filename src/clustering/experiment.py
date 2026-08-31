@@ -62,6 +62,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from clustering.baselines.mst_decay import BaselineResult, DecayStep, MSTDecayBaseline
+from clustering.baselines.saca import SACABaseline, SacaParams
 from clustering.split_prediction.dataset import NucleonDataset, collate_fn
 from clustering.split_prediction.model import SplitPredictionModel, SplitValueCritic
 from clustering.split_prediction.mst import MSTPretrainer
@@ -257,6 +258,18 @@ class ClusteringConfig:
     #     — one row per emitted nucleon, carrying the parent (A, Z), its table
     #     verdict, both candidate daughters, and why the channel was chosen.
     baseline_trace: bool = False
+    # baseline_algo: "mst" = MST/MSTp fragments straight to the decay stage;
+    # "saca" = MST seeds rearranged by simulated annealing first (SACA_PIPELINE.md).
+    # The SACA knobs are its annealing schedule; e_cut is the binding-energy per
+    # nucleon below which a fragment counts as bound.
+    baseline_algo: str = "mst"
+    saca_t_max: float = 20.0
+    saca_t_min: float = 0.5
+    saca_alpha: float = 0.9
+    saca_trials_per_nucleon: int = 4
+    saca_e_cut: float = -4.0
+    saca_p_release: float = 0.3
+    saca_two_pass: bool = True
 
     type_index: int = 7
     input_dim: int = 8
@@ -723,9 +736,9 @@ def run_baseline(exp: Ctx) -> None:
         cuts.append(f"d_cut={cfg.baseline_d_cut} fm")
     if cfg.baseline_metric in ("mstp", "momentum"):
         cuts.append(f"p_cut={cfg.baseline_p_cut} MeV/c ({cfg.baseline_p_frame})")
-    print(f"metric={cfg.baseline_metric}: {', '.join(cuts)}; table: {len(lut)} nuclei")
-    baseline = MSTDecayBaseline(
-        lut,
+    print(f"algo={cfg.baseline_algo}, metric={cfg.baseline_metric}: "
+          f"{', '.join(cuts)}; table: {len(lut)} nuclei")
+    common = dict(
         d_cut=cfg.baseline_d_cut,
         p_cut=cfg.baseline_p_cut,
         metric=cfg.baseline_metric,
@@ -735,6 +748,20 @@ def run_baseline(exp: Ctx) -> None:
         type_index=cfg.type_index,
         trace=cfg.baseline_trace,
     )
+    if cfg.baseline_algo == "saca":
+        params = SacaParams(
+            t_max=cfg.saca_t_max, t_min=cfg.saca_t_min, alpha=cfg.saca_alpha,
+            trials_per_nucleon=cfg.saca_trials_per_nucleon, e_cut=cfg.saca_e_cut,
+            p_release=cfg.saca_p_release, two_pass=cfg.saca_two_pass,
+        )
+        print(f"SACA: T {params.t_max} -> {params.t_min} MeV, alpha={params.alpha}, "
+              f"{params.trials_per_nucleon} trials/nucleon, e_cut={params.e_cut} MeV/A, "
+              f"two_pass={params.two_pass}")
+        baseline = SACABaseline(lut, params=params, seed=int(cfg.seed), **common)
+    elif cfg.baseline_algo == "mst":
+        baseline = MSTDecayBaseline(lut, **common)
+    else:
+        raise ValueError(f"unknown baseline_algo {cfg.baseline_algo!r}; expected 'mst' or 'saca'")
     tally = {"n_primary": 0, "n_primary_in_table": 0, "n_evaporated": 0}
     steps: List[DecayStep] = []
     seen = [0]  # event counter, in the order _fragment_report walks them
@@ -765,6 +792,11 @@ def run_baseline(exp: Ctx) -> None:
           f"(known nuclei: {tally['n_primary_in_table']}, {frac_known:.1%})")
     print(f"Nucleons evaporated by the decay stage: {tally['n_evaporated']}")
     ctx = {"stage": "baseline"}
+    if isinstance(baseline, SACABaseline):
+        print(f"SACA energy: {baseline.e_initial:.0f} -> {baseline.e_final:.0f} MeV "
+              f"(total over events); moves accepted {baseline.n_accepted}/{baseline.n_proposed}")
+        exp.track(baseline.e_initial, name="saca_e_initial", context=ctx)
+        exp.track(baseline.e_final, name="saca_e_final", context=ctx)
     exp.track(tally["n_primary"], name="primary_fragments", context=ctx)
     exp.track(tally["n_primary_in_table"], name="primary_fragments_in_table", context=ctx)
     exp.track(frac_known, name="primary_in_table_frac", context=ctx)
