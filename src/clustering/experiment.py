@@ -811,6 +811,7 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
     nuclei_eta: List[float] = []
     nucleon_eta: List[float] = []
     n_frags_per_event: List[int] = []
+    n_frags_a2_per_event: List[int] = []   # free nucleons excluded — see below
     split_depths: List[int] = []
 
     # Event-level diagnostics (one entry per event) ---------------------------
@@ -849,6 +850,8 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
             result = fragment_fn(event)
 
             n_frags_per_event.append(len(result.fragments))
+            n_frags_a2_per_event.append(
+                sum(1 for f in result.fragments if f.shape[0] >= 2))
             split_depths.extend(result.split_depths)
 
             # Output (fragment) totals, accumulated over this event.
@@ -865,14 +868,16 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
                 nuclei_Z.append(Z)
                 p_f = frag_np[:, :3].sum(0)
                 pn = float(np.linalg.norm(p_f))
-                if pn > 0:
-                    nuclei_eta.append(float(-np.arctanh(p_f[2] / pn)))
+                # NaN rather than a skip: nuclei_eta has to stay index-aligned
+                # with nuclei_A so the A >= 2 mask below selects the right rows.
+                nuclei_eta.append(float(-np.arctanh(p_f[2] / pn)) if pn > 0 else np.nan)
                 sum_a += A
                 sum_z += Z
                 p_out_sum += p_f
                 e_out_sum += float(frag_np[:, 3].sum())
                 max_z = max(max_z, Z)
-                frag_pt_pn.append(float(np.hypot(p_f[0], p_f[1]) / A))  # per nucleon
+                if A >= 2:
+                    frag_pt_pn.append(float(np.hypot(p_f[0], p_f[1]) / A))  # per nucleon
 
             ev_max_z.append(max_z)
             ev_frag_pt_pn.append(float(np.mean(frag_pt_pn)) if frag_pt_pn else np.nan)
@@ -887,7 +892,18 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
     nuclei_Z_arr = np.array(nuclei_Z)
     nuclei_N_arr = nuclei_A_arr - nuclei_Z_arr
     n_frags_arr = np.array(n_frags_per_event)
+    n_frags_a2_arr = np.array(n_frags_a2_per_event)
     split_depths_arr = np.array(split_depths)
+
+    # Free protons and neutrons are excluded from every *fragment* plot below.
+    # They are ~75-90% of the fragment list and sit in a single (A, Z) cell, so
+    # on a log-scaled map they set the colour range on their own and flatten
+    # every real nucleus into the bottom decade.  They are still counted
+    # everywhere their absence would be a lie: the printed totals, the Aim
+    # scalars, fragment_yields.csv, and the conservation residuals — which must
+    # see them or they would report a violation that did not happen.
+    a2 = nuclei_A_arr >= 2
+    nuclei_eta_arr = np.array(nuclei_eta)
 
     n_events_seen = cfg.n_vis * len(vis_datasets)
     n_frag_total = len(nuclei_A_arr)
@@ -916,12 +932,12 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
 
     _dump_fragment_yields(exp, nuclei_A_arr, nuclei_Z_arr, n_events_seen)
 
-    _plot_n_fragments(exp, n_frags_arr)
+    _plot_n_fragments(exp, n_frags_a2_arr)
     # The baseline performs no tree splits, so this plot would be an empty axes.
     if len(split_depths_arr):
         _plot_splits_per_level(exp, split_depths_arr)
-    _plot_eta(exp, np.array(nucleon_eta), np.array(nuclei_eta))
-    _plot_az_nz(exp, nuclei_A_arr, nuclei_Z_arr, nuclei_N_arr)
+    _plot_eta(exp, np.array(nucleon_eta), nuclei_eta_arr[a2])
+    _plot_az_nz(exp, nuclei_A_arr[a2], nuclei_Z_arr[a2], nuclei_N_arr[a2])
 
     # Event-level diagnostics
     _plot_conservation(exp, np.array(cons_dA), np.array(cons_dZ),
@@ -972,8 +988,8 @@ def _plot_n_fragments(exp: Ctx, n_frags: np.ndarray) -> None:
     ax.hist(n_frags, bins=bins, color="mediumseagreen", edgecolor="black", lw=0.5)
     ax.axvline(n_frags.mean(), color="crimson", linestyle="--", lw=1.5,
                label=f"mean = {n_frags.mean():.1f}")
-    ax.set(xlabel="Fragments per event", ylabel="Events",
-           title="Fragment multiplicity")
+    ax.set(xlabel="Fragments per event  (A ≥ 2)", ylabel="Events",
+           title="Fragment multiplicity  (free nucleons excluded)")
     ax.legend()
     exp.save_fig(fig, "fragment_multiplicity.png")
 
@@ -990,7 +1006,8 @@ def _plot_eta(exp: Ctx, nucleon_eta: np.ndarray, nuclei_eta: np.ndarray) -> None
     ax_nu.set(xlabel="Pseudorapidity η", ylabel="Count", title="Nucleons (pre-split)")
     if len(nuclei_eta):
         ax_nuc.hist(nuclei_eta, bins=100, color="darkorange")
-    ax_nuc.set(xlabel="Pseudorapidity η", ylabel="Count", title="Identified fragments (all A)")
+    ax_nuc.set(xlabel="Pseudorapidity η", ylabel="Count",
+               title="Identified fragments (A ≥ 2)")
     exp.save_fig(fig, "fragment_eta.png")
 
 
@@ -1009,10 +1026,10 @@ def _plot_az_nz(exp: Ctx, A: np.ndarray, Z: np.ndarray, N: np.ndarray) -> None:
     bins_Z = _edges(Z)
     bins_N = _edges(N)
     h1 = ax_AZ.hist2d(A, Z, bins=[bins_A, bins_Z], cmap="viridis", norm=LogNorm())
-    ax_AZ.set(xlabel="A", ylabel="Z", title="A vs Z")
+    ax_AZ.set(xlabel="A", ylabel="Z", title="A vs Z  (A ≥ 2)")
     fig.colorbar(h1[3], ax=ax_AZ, label="Count")
     h2 = ax_NZ.hist2d(N, Z, bins=[bins_N, bins_Z], cmap="viridis", norm=LogNorm())
-    ax_NZ.set(xlabel="N", ylabel="Z", title="N vs Z")
+    ax_NZ.set(xlabel="N", ylabel="Z", title="N vs Z  (A ≥ 2)")
     fig.colorbar(h2[3], ax=ax_NZ, label="Count")
     exp.save_fig(fig, "fragment_az_nz.png")
 
@@ -1054,7 +1071,7 @@ def _plot_mean_pt(exp: Ctx, nucleon_pt: np.ndarray, frag_pt_pn: np.ndarray) -> N
     ax.hist(nucleon_pt, bins=bins, alpha=0.6, color="steelblue",
             label=f"nucleons  (mean {nucleon_pt.mean():.3f})")
     ax.hist(frag_pt_pn, bins=bins, alpha=0.6, color="darkorange",
-            label=f"fragments / nucleon  (mean {frag_pt_pn.mean():.3f})")
+            label=f"fragments (A ≥ 2) / nucleon  (mean {frag_pt_pn.mean():.3f})")
     ax.set(xlabel="⟨pₜ⟩ per event [GeV/c]", ylabel="Events",
            title="Mean transverse momentum")
     ax.legend()
