@@ -61,7 +61,14 @@ SKYRME_EOS: Dict[str, Tuple[float, float, float]] = {
     "soft_mdi": (-390.1, 320.3, 1.14),   # PHQMD's SM row (its delta term omitted)
 }
 
-RHO_0 = 0.168        # fm^-3, PHQMD's value
+# rho_0 travels with the Skyrme set and must not be mixed across codes.  The
+# alpha/beta/gamma above are BQMD's, whose native rho_0 is 0.15 fm^-3.  Pairing
+# them with PHQMD's 0.168 shifts the saturation depth (-13.9 instead of -16.5),
+# and going the other way is worse: PHQMD's own alpha/beta/gamma
+# (-390.1/320.3/1.14) are the *momentum-dependent* set, and used without their
+# MDI term they do not saturate at all — measured minimum at 1.5 rho_0, E/A =
+# -21.6 MeV/A.  See papers/notes/yukawa_and_parameters.md.
+RHO_0 = 0.15         # fm^-3, BQMD
 # Wave-packet width.  The papers quote three values for three codes — PHQMD
 # 2.16, BQMD 4.33, IQMD 8.66 fm^2 — a factor-of-2 trap flagged in
 # papers/notes/saca_puri_aichelin.md.  Bulk saturation is insensitive to the
@@ -151,14 +158,17 @@ def cluster_energy(nucleons: np.ndarray, *, eos: str = "soft",
 
     Sign convention: negative means bound.
 
-    ``yukawa`` defaults to **off**.  FRIGA lists Yukawa among SACA's terms, but
-    none of the papers in ``papers/`` prints a coefficient for it in the
-    alpha/beta parameterization used here, and alpha/beta are *already* jointly
-    fitted to reproduce saturation on their own (alpha/2 + beta/(gamma+1) +
-    T/A = -16 MeV/nucleon).  Switching on this repo's legacy V_0 = -85.1 MeV fm
-    adds -60 MeV/nucleon of extra attraction at rho_0 and destroys saturation
-    outright — it belongs to the t_1 parameterization, not this one.  Rather
-    than invent a coefficient, the term is available but off.
+    ``yukawa`` defaults to **off**, and for BQMD's parameters that is the
+    self-consistent choice rather than an omission.  BQMD compensates the Yukawa
+    inside the Skyrme coupling precisely so that binding stays Yukawa-independent
+    — Hartnack et al. (Eur. Phys. J. A 1, 151), verbatim: "In order to keep the
+    nuclear equation of state and the binding energy independent of the Yukawa
+    interactions and to keep the binding energy at its experimental value, the
+    coupling constant t1 of the Skyrme-type two body interaction is modified".
+    So the tabulated alpha = -356 MeV is already post-compensation, and adding an
+    attractive Yukawa on top of it *double-counts*.  No source in ``papers/``
+    prints a Yukawa coefficient anyway (all four defer to Aichelin, Phys. Rep.
+    202 (1991), which we do not have), so the term stays available and off.
     """
     n = nucleons.shape[0]
     terms = EnergyTerms()

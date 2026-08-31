@@ -8,7 +8,7 @@ Checks, in order:
      the density it was built from, or the Skyrme coefficients do not transfer.
   2. **Nuclear matter saturates**, with the minimum at rho_0 and the right depth.
      The analytic value for the soft EoS is
-         T/A + alpha/2 + beta/(gamma+1) = 21.6 - 178.0 + 139.8 = -16.6 MeV/A.
+         T/A + alpha/2 + beta/(gamma+1) = 21.8 - 178.0 + 139.8 = -17.0 MeV/A.
      This is the property the repo's own potential lacks — see
      tests/test_nuclear_matter.py, which fails on purpose.
   3. **A boost changes nothing.**  The same nucleus Lorentz-boosted to the beam
