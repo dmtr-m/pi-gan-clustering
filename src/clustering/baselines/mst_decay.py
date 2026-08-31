@@ -8,9 +8,10 @@ before any model is involved.
 Two stages, mirroring how transport codes are actually post-processed:
 
 1. **Primary fragments** — connected components of the MST graph
-   (``clustering.split_prediction.mst.mst_clusters``): nucleons within ``d_cut``
-   in coordinate space, and, with ``use_momentum``, within ``p_cut`` of relative
-   momentum in the pair rest frame (MSTp).
+   (``clustering.split_prediction.mst.mst_clusters``), under one of three link
+   criteria: ``"coord"`` (|Δr| < ``d_cut``), ``"mstp"`` (that *and* |Δp| <
+   ``p_cut`` in the pair rest frame), or ``"momentum"`` (|Δp| alone, coordinates
+   ignored).
 
 2. **Secondary decay** — a primary fragment is emitted only if its ``(A, Z)``
    appears in the known-nuclei table; otherwise it evaporates one nucleon and the
@@ -166,7 +167,7 @@ class MSTDecayBaseline:
         *,
         d_cut: float = D_CUT,
         p_cut: float = P_CUT,
-        use_momentum: bool = True,
+        metric: str = "mstp",
         p_frame: str = P_FRAME,
         decay: bool = True,
         emit_rule: str = "hottest",
@@ -175,7 +176,7 @@ class MSTDecayBaseline:
         self.lut = lut
         self.d_cut = d_cut
         self.p_cut = p_cut
-        self.use_momentum = use_momentum
+        self.metric = metric
         self.p_frame = p_frame
         self.decay = decay
         self.emit_rule = emit_rule
@@ -187,7 +188,7 @@ class MSTDecayBaseline:
         x = event.unsqueeze(0)
         mask = torch.ones(1, event.shape[0], dtype=torch.bool, device=event.device)
         labels = mst_clusters(x, mask, self.d_cut, self.p_cut,
-                              self.use_momentum, self.p_frame)[0]
+                              self.metric, self.p_frame)[0]
 
         primaries = [event[labels == c] for c in labels.unique() if c >= 0]
         n_in_table = sum(

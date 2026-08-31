@@ -237,7 +237,9 @@ class ClusteringConfig:
     # nuclei table.  Nothing is trained and no checkpoint is read, so
     # `stages=[4]` runs standalone and fixes the scale for every Stage-3
     # observable.  Uses n_vis events per spectator side, like Stage 3.
-    #   baseline_use_momentum: MSTp (relative-momentum cut) vs coordinate-only MST.
+    #   baseline_metric: "coord" (|Δr| < d_cut), "mstp" (that and |Δp| < p_cut),
+    #     or "momentum" (|Δp| alone — coordinates ignored; percolates at a much
+    #     smaller p_cut than mstp, so do not carry the 250 MeV/c value over).
     #   baseline_p_frame: "pair_cm" (boost to the pair rest frame) or "lab".
     #   baseline_decay: False emits the primary fragments untouched, which is the
     #     ablation that isolates what the decay stage contributes.
@@ -245,7 +247,7 @@ class ClusteringConfig:
     #     "hottest" (max kinetic energy in the fragment rest frame), "outermost",
     #     or "first".
     baseline_d_cut: float = 2.0
-    baseline_use_momentum: bool = True
+    baseline_metric: str = "mstp"
     baseline_p_cut: float = 250.0
     baseline_p_frame: str = "pair_cm"
     baseline_decay: bool = True
@@ -711,16 +713,17 @@ def run_baseline(exp: Ctx) -> None:
     print("\n=== Stage 4 — MST baseline"
           f"{' + stability decay' if cfg.baseline_decay else ' (primaries only)'} ===")
     lut = StabilityLookup(cfg.csv_path)
-    mode = "MSTp" if cfg.baseline_use_momentum else "MST"
-    print(f"{mode}: d_cut={cfg.baseline_d_cut} fm"
-          + (f", p_cut={cfg.baseline_p_cut} MeV/c ({cfg.baseline_p_frame})"
-             if cfg.baseline_use_momentum else "")
-          + f"; table: {len(lut)} nuclei")
+    cuts = []
+    if cfg.baseline_metric in ("coord", "mstp"):
+        cuts.append(f"d_cut={cfg.baseline_d_cut} fm")
+    if cfg.baseline_metric in ("mstp", "momentum"):
+        cuts.append(f"p_cut={cfg.baseline_p_cut} MeV/c ({cfg.baseline_p_frame})")
+    print(f"metric={cfg.baseline_metric}: {', '.join(cuts)}; table: {len(lut)} nuclei")
     baseline = MSTDecayBaseline(
         lut,
         d_cut=cfg.baseline_d_cut,
         p_cut=cfg.baseline_p_cut,
-        use_momentum=cfg.baseline_use_momentum,
+        metric=cfg.baseline_metric,
         p_frame=cfg.baseline_p_frame,
         decay=cfg.baseline_decay,
         emit_rule=cfg.baseline_emit_rule,
