@@ -267,7 +267,8 @@ class ClusteringConfig:
     saca_t_min: float = 0.5
     saca_alpha: float = 0.9
     saca_trials_per_nucleon: int = 4
-    saca_e_cut: float = -4.0
+    saca_e_cut: float = -4.0        # MeV/nucleon, N_f >= 3
+    saca_e_cut_light: float = 0.0   # MeV/nucleon, N_f < 3 (Puri & Aichelin)
     saca_p_release: float = 0.3
     saca_two_pass: bool = True
 
@@ -752,10 +753,12 @@ def run_baseline(exp: Ctx) -> None:
         params = SacaParams(
             t_max=cfg.saca_t_max, t_min=cfg.saca_t_min, alpha=cfg.saca_alpha,
             trials_per_nucleon=cfg.saca_trials_per_nucleon, e_cut=cfg.saca_e_cut,
+            e_cut_light=cfg.saca_e_cut_light,
             p_release=cfg.saca_p_release, two_pass=cfg.saca_two_pass,
         )
         print(f"SACA: T {params.t_max} -> {params.t_min} MeV, alpha={params.alpha}, "
-              f"{params.trials_per_nucleon} trials/nucleon, e_cut={params.e_cut} MeV/A, "
+              f"{params.trials_per_nucleon} trials/nucleon, "
+              f"e_cut={params.e_cut}/{params.e_cut_light} MeV/A (N_f>=3 / <3), "
               f"two_pass={params.two_pass}")
         baseline = SACABaseline(lut, params=params, seed=int(cfg.seed), **common)
     elif cfg.baseline_algo == "mst":

@@ -37,8 +37,9 @@ straight into a binding-energy criterion.
 Pipeline (SACA_PIPELINE.md)
 ---------------------------
 1. MST pre-fragments + free nucleons.
-2. Classify: ``zeta < e_cut`` (default -4 MeV/nucleon) is *stable*, the rest
-   *unstable*.
+2. Classify: bound if ``zeta < L_be``, with ``L_be = e_cut`` (-4 MeV/nucleon)
+   for ``N_f >= 3`` and ``e_cut_light`` (0) below that — the original SACA
+   criterion.  Everything else is *unstable*.
 3. Pass 1 — anneal each unstable fragment on its own, allowing nucleons to be
    released or moved between its pieces.  Pieces that end up bound are kept;
    the rest are dissolved into free nucleons.
@@ -68,7 +69,14 @@ class SacaParams:
     t_min: float = 0.5
     alpha: float = 0.9          # geometric cooling, T <- alpha * T
     trials_per_nucleon: int = 4  # trials at each temperature = this * N
-    e_cut: float = -4.0         # MeV/nucleon; below it a fragment counts as bound
+    # Puri & Aichelin's admissibility criterion (ALPHAXIV_FORMULA_CONVERSATION.md):
+    # zeta < L_be with L_be = -4 MeV/nucleon for N_f >= 3 and L_be = 0 below that.
+    # The size split is not cosmetic — a real deuteron is bound at -1.1
+    # MeV/nucleon, so a uniform -4 cut forbids deuterons by construction, and
+    # they are the generator's most abundant species.  SACA_PIPELINE.md's CCL
+    # variant uses -4 for every size; set e_cut_light=-4.0 to reproduce it.
+    e_cut: float = -4.0         # MeV/nucleon, fragments with N_f >= 3
+    e_cut_light: float = 0.0    # MeV/nucleon, fragments with N_f < 3
     p_release: float = 0.3      # probability a pass-1 move is "release to free"
     two_pass: bool = True
 
@@ -107,6 +115,14 @@ class _SacaEvent:
     def zeta(self, idx: np.ndarray) -> float:
         """Binding energy per nucleon [MeV]; the quantity ``e_cut`` tests."""
         return self.fragment_energy(idx) / max(1, len(idx))
+
+
+def _is_bound(ev: "_SacaEvent", idx: np.ndarray, params: SacaParams) -> bool:
+    """The SACA admissibility test, with its size-dependent threshold."""
+    if len(idx) < 2:
+        return False
+    cut = params.e_cut if len(idx) >= 3 else params.e_cut_light
+    return ev.zeta(idx) < cut
 
 
 def _clusters_from_labels(labels: np.ndarray) -> Dict[int, List[int]]:
@@ -242,8 +258,7 @@ def saca_clusters(
     # Step 2 — stable / unstable by binding energy per nucleon.
     stable, unstable = {}, {}
     for c, members in clusters.items():
-        (stable if len(members) > 1 and ev.zeta(np.asarray(members)) < params.e_cut
-         else unstable)[c] = members
+        (stable if _is_bound(ev, np.asarray(members), params) else unstable)[c] = members
     n_unstable = sum(1 for m in unstable.values() if len(m) > 1)
 
     n_prop = n_acc = 0
@@ -259,7 +274,7 @@ def saca_clusters(
         sub, pr, ac = _anneal(ev, sub, params, rng, allow_loss=True)
         n_prop += pr; n_acc += ac
         for m in sub.values():
-            if len(m) > 1 and ev.zeta(np.asarray(m)) < params.e_cut:
+            if _is_bound(ev, np.asarray(m), params):
                 pass1[next_id] = m
                 next_id += 1
             else:
