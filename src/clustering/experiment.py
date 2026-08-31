@@ -63,6 +63,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from clustering.baselines.mst_decay import BaselineResult, DecayStep, MSTDecayBaseline
+from clustering.baselines.coalescence import CoalescenceBaseline
 from clustering.baselines.saca import SACABaseline, SacaParams
 from clustering.split_prediction.dataset import NucleonDataset, collate_fn
 from clustering.split_prediction.model import SplitPredictionModel, SplitValueCritic
@@ -263,7 +264,13 @@ class ClusteringConfig:
     # "saca" = MST seeds rearranged by simulated annealing first (SACA_PIPELINE.md).
     # The SACA knobs are its annealing schedule; e_cut is the binding-energy per
     # nucleon below which a fragment counts as bound.
-    baseline_algo: str = "mst"
+    baseline_algo: str = "mst"     # "mst" | "saca" | "coalescence"
+    # Coalescence (Kireyeu arXiv:2512.02084 Table 3).  coal_cut_set picks the
+    # per-species (dr, dp) box; coal_selection is "none" (no formation
+    # probability — the paper's factors are not published) or "ebind", the
+    # paper's "mixed" procedure, which keeps only bound candidates.
+    coal_cut_set: str = "M1"
+    coal_selection: str = "none"
     # Wall-clock budget for the Stage 3/4 event loop, in minutes (0 = no limit).
     # A SACA run is minutes-to-hours depending on n_vis, and an over-running job
     # is indistinguishable from a hung one; this stops cleanly on the event
@@ -767,10 +774,19 @@ def run_baseline(exp: Ctx) -> None:
               f"e_cut={params.e_cut}/{params.e_cut_light} MeV/A (N_f>=3 / <3), "
               f"two_pass={params.two_pass}")
         baseline = SACABaseline(lut, params=params, seed=int(cfg.seed), **common)
+    elif cfg.baseline_algo == "coalescence":
+        print(f"Coalescence: cut set {cfg.coal_cut_set}, selection={cfg.coal_selection}")
+        baseline = CoalescenceBaseline(lut, cut_set=cfg.coal_cut_set,
+                                       selection=cfg.coal_selection,
+                                       decay=cfg.baseline_decay,
+                                       emit_rule=cfg.baseline_emit_rule,
+                                       type_index=cfg.type_index,
+                                       trace=cfg.baseline_trace)
     elif cfg.baseline_algo == "mst":
         baseline = MSTDecayBaseline(lut, **common)
     else:
-        raise ValueError(f"unknown baseline_algo {cfg.baseline_algo!r}; expected 'mst' or 'saca'")
+        raise ValueError(f"unknown baseline_algo {cfg.baseline_algo!r}; "
+                         f"expected 'mst', 'saca' or 'coalescence'")
     tally = {"n_primary": 0, "n_primary_in_table": 0, "n_evaporated": 0}
     steps: List[DecayStep] = []
     seen = [0]  # event counter, in the order _fragment_report walks them
