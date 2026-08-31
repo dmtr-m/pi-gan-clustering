@@ -54,7 +54,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from clustering.physics import pairwise_potential_matrix
+from clustering.baselines.qmd_energy import cluster_energy
 from clustering.split_prediction.mst import D_CUT, P_CUT, P_FRAME, mst_clusters
 
 MASS_PROTON = 0.938272   # GeV/c^2
@@ -82,35 +82,35 @@ class SacaParams:
 
 
 class _SacaEvent:
-    """Per-event caches: the pair-potential matrix and the momenta.
+    """Per-event cache of the nucleon array, in numpy.
 
-    The matrix is what makes annealing affordable.  Every move changes the
-    membership of one nucleon, so the energy of the two affected fragments is a
-    submatrix sum rather than a fresh O(N^2) potential evaluation with its
-    Lorentz boosts.
+    There is no precomputed pair-potential matrix any more, and there cannot be:
+    the Skyrme term is per nucleon in the interaction density, so a fragment's
+    energy is not a sum over its pairs and a membership change cannot be scored
+    by a submatrix sum.  Each evaluation recomputes the fragment — same O(k^2)
+    order as the submatrix sum it replaces, plus the boost to the fragment rest
+    frame, which is O(k) and is not optional: scoring spectator fragments in the
+    lab frame biases them by ~+8.6 MeV/nucleon and makes bound ones look free.
     """
 
     def __init__(self, event: torch.Tensor, type_index: int = 7) -> None:
-        x = event.unsqueeze(0)
-        mask = torch.ones(1, event.shape[0], dtype=torch.bool, device=event.device)
-        self.V = pairwise_potential_matrix(x, mask)[0].cpu().numpy().astype(np.float64)
-        self.p = event[:, 0:3].cpu().numpy().astype(np.float64)
-        is_p = event[:, type_index].cpu().numpy() == 1
-        self.m = np.where(is_p, MASS_PROTON, MASS_NEUTRON)
+        self.x = event.cpu().numpy().astype(np.float64)
         self.n = event.shape[0]
+        self._cache: Dict[Tuple[int, ...], float] = {}
 
     def fragment_energy(self, idx: np.ndarray) -> float:
-        """E_f = kinetic energy in the fragment frame + SUM_{a<b} V_ab, in MeV."""
+        """Total energy of the fragment [MeV]; negative means bound."""
         k = len(idx)
-        if k < 2:
+        if k < 1:
             return 0.0
-        p = self.p[idx]
-        m = self.m[idx]
-        p_rel = p - p.sum(0) / k
-        kinetic = float((np.sqrt((p_rel ** 2).sum(1) + m ** 2) - m).sum()) * GEV_TO_MEV
-        # V holds both (a,b) and (b,a); halving the submatrix sum gives a < b.
-        potential = float(self.V[np.ix_(idx, idx)].sum()) / 2.0
-        return kinetic + potential
+        if k == 1:
+            return 0.0    # a free nucleon: no partner, and no internal motion
+        key = tuple(sorted(int(i) for i in idx))
+        hit = self._cache.get(key)
+        if hit is None:
+            hit = cluster_energy(self.x[list(key)]).total
+            self._cache[key] = hit
+        return hit
 
     def zeta(self, idx: np.ndarray) -> float:
         """Binding energy per nucleon [MeV]; the quantity ``e_cut`` tests."""
