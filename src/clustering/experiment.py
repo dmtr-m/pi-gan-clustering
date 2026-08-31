@@ -40,6 +40,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import random
+import time
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -263,6 +264,11 @@ class ClusteringConfig:
     # The SACA knobs are its annealing schedule; e_cut is the binding-energy per
     # nucleon below which a fragment counts as bound.
     baseline_algo: str = "mst"
+    # Wall-clock budget for the Stage 3/4 event loop, in minutes (0 = no limit).
+    # A SACA run is minutes-to-hours depending on n_vis, and an over-running job
+    # is indistinguishable from a hung one; this stops cleanly on the event
+    # boundary and reports on what it actually processed.
+    report_time_budget_min: float = 40.0
     saca_t_max: float = 20.0
     saca_t_min: float = 0.5
     saca_alpha: float = 0.9
@@ -770,8 +776,11 @@ def run_baseline(exp: Ctx) -> None:
     seen = [0]  # event counter, in the order _fragment_report walks them
 
     def fragment_fn(event: torch.Tensor) -> BaselineResult:
-        # The baseline is numpy/scipy-bound; keep it on the CPU regardless of
-        # cfg.device, which only ever helped the neural path.
+        # Both baselines are numpy/scipy-bound; keep them on the CPU regardless
+        # of cfg.device, which only ever helped the neural path.  This is not
+        # cosmetic for SACA: its inner loop is thousands of small tensor ops per
+        # event, and on MPS the launch overhead and the sync on every .cpu()
+        # make it 2.4x slower than the same code on CPU (0.80 vs 0.33 s/event).
         res = baseline(event.cpu())
         for k in tally:
             tally[k] += getattr(res, k)
@@ -862,8 +871,33 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
     cons_dpz: List[float] = []
     cons_dE: List[float] = []
 
+    # Progress: Stage 4 with SACA runs for tens of minutes and used to print
+    # nothing at all until the very end, so a slow run was indistinguishable
+    # from a hung one.
+    n_total = sum(min(cfg.n_vis, len(d)) for d in vis_datasets.values())
+    t_start = time.time()
+    n_done = 0
+    budget_hit = False
+    budget_s = float(cfg.report_time_budget_min) * 60.0
+    report_every = max(1, n_total // 20)
+
     for ds in vis_datasets.values():
+        if budget_hit:
+            break
         for idx in range(min(cfg.n_vis, len(ds))):
+            if budget_s and (time.time() - t_start) > budget_s:
+                print(f"  [budget] stopped after {n_done}/{n_total} events "
+                      f"({(time.time() - t_start)/60:.1f} min > "
+                      f"{cfg.report_time_budget_min} min budget); "
+                      f"everything below is normalized to the events actually "
+                      f"processed.", flush=True)
+                budget_hit = True
+                break
+            n_done += 1
+            if n_done % report_every == 0:
+                el = time.time() - t_start
+                print(f"  [{n_done}/{n_total}]  {el/60:.1f} min elapsed, "
+                      f"~{(n_total - n_done) * el / n_done / 60:.1f} min left", flush=True)
             event = ds[idx].to(cfg.device)  # (N, 8)
             ev_np = event.cpu().numpy()
 
@@ -940,7 +974,10 @@ def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
     a2 = nuclei_A_arr >= 2
     nuclei_eta_arr = np.array(nuclei_eta)
 
-    n_events_seen = cfg.n_vis * len(vis_datasets)
+    # The number of events actually walked — NOT cfg.n_vis * n_datasets, which
+    # over-counts whenever a dataset is shorter than n_vis or the time budget cut
+    # the loop short, and would silently deflate every per-event yield.
+    n_events_seen = n_done
     n_frag_total = len(nuclei_A_arr)
     n_a1 = int((nuclei_A_arr == 1).sum())
     n_a2 = int((nuclei_A_arr >= 2).sum())
