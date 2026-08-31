@@ -31,7 +31,7 @@ fragment into free-nucleon fragments, so ΣA, ΣZ and Σp over the output equal 
 input event.  Stage 3's conservation plots should read identically zero.
 """
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -40,6 +40,34 @@ from clustering.split_prediction.mst import D_CUT, P_CUT, P_FRAME, mst_clusters
 from clustering.stability.lookup import StabilityLookup
 
 NUCLEON_MASS = 0.938272  # GeV/c² — the parquet stores E and p in GeV
+
+
+@dataclass
+class DecayStep:
+    """One evaporation step, recorded verbatim so the rule can be audited.
+
+    Every field is what the code actually looked at when it made the decision,
+    in the order it looked at it: the parent (A, Z) and its table verdict, both
+    candidate daughters with their own verdicts and Weizsacker binding, which
+    channel won, and which physical nucleon left.
+    """
+    event: int = -1          # index within the visualization pass
+    fragment: int = -1       # index of the primary fragment inside that event
+    step: int = 0            # 0-based, counting evaporations from this primary
+    A: int = 0
+    Z: int = 0
+    in_table: bool = False   # always False for a step that happened
+    n_daughter_in_table: bool = False   # (A-1, Z)
+    n_daughter_binding: float = 0.0
+    p_daughter_in_table: bool = False   # (A-1, Z-1)
+    p_daughter_binding: float = 0.0
+    emitted: str = ""        # "n" or "p"
+    emitted_reason: str = "" # which of the two tie-breaks decided it
+    emitted_index: int = -1  # row of the emitted nucleon within the fragment
+    emitted_ke_mev: float = 0.0   # its kinetic energy in the fragment rest frame
+    A_after: int = 0
+    Z_after: int = 0
+    after_in_table: bool = False
 
 
 @dataclass
@@ -52,6 +80,7 @@ class BaselineResult:
     n_primary: int = 0            # fragments before decay
     n_primary_in_table: int = 0   # of those, already a known nucleus
     n_evaporated: int = 0         # nucleons emitted by the decay stage
+    steps: List[DecayStep] = field(default_factory=list)  # empty unless tracing
 
 
 def _AZ(frag: torch.Tensor, type_index: int = 7) -> Tuple[int, int]:
@@ -105,6 +134,7 @@ def decay_to_table(
     *,
     emit_rule: str = "hottest",
     type_index: int = 7,
+    trace: Optional[List[DecayStep]] = None,
 ) -> Tuple[List[torch.Tensor], int]:
     """Evaporate nucleons until every piece is a known nucleus (or a free nucleon).
 
@@ -127,29 +157,58 @@ def decay_to_table(
     """
     out: List[torch.Tensor] = []
     n_evaporated = 0
+    step = 0
     stack = [frag]
     while stack:
         f = stack.pop()
         A, Z = _AZ(f, type_index)
+        # Step 1 — open the table.  In it (or a free nucleon): emit, done.
         if A <= 1 or lut.is_stable(A, Z):
             out.append(f)
             continue
 
+        # Step 2 — not in the table, so it decays.  Two channels are open.
         N = A - Z
-        # (in_table, binding) — lexicographic, higher is better.
+        n_ok = n_b = p_ok = p_b = None
         channels = []
         if N > 0:
-            channels.append((False, (lut.is_stable(A - 1, Z), _binding(A - 1, Z))))
+            n_ok, n_b = lut.is_stable(A - 1, Z), _binding(A - 1, Z)
+            channels.append((False, (n_ok, n_b)))
         if Z > 0:
-            channels.append((True, (lut.is_stable(A - 1, Z - 1), _binding(A - 1, Z - 1))))
+            p_ok, p_b = lut.is_stable(A - 1, Z - 1), _binding(A - 1, Z - 1)
+            channels.append((True, (p_ok, p_b)))
+        # (in_table, binding) — lexicographic, higher is better.
         want_proton, _ = max(channels, key=lambda c: c[1])
 
+        # Step 3 — pick the physical nucleon of that species and emit it.
         i = _emission_index(f, want_proton, emit_rule, type_index)
         keep = torch.ones(A, dtype=torch.bool, device=f.device)
         keep[i] = False
         out.append(f[~keep])          # the free nucleon
         n_evaporated += 1
         stack.append(f[keep])         # the remainder, re-tested next iteration
+
+        if trace is not None:
+            a2, z2 = A - 1, (Z - 1 if want_proton else Z)
+            if n_ok is None or p_ok is None:
+                reason = "only channel open"
+            elif bool(n_ok) != bool(p_ok):
+                reason = "table membership"
+            else:
+                reason = "binding (table tied)"
+            trace.append(DecayStep(
+                step=step, A=A, Z=Z, in_table=False,
+                n_daughter_in_table=bool(n_ok) if n_ok is not None else False,
+                n_daughter_binding=float(n_b) if n_b is not None else float("nan"),
+                p_daughter_in_table=bool(p_ok) if p_ok is not None else False,
+                p_daughter_binding=float(p_b) if p_b is not None else float("nan"),
+                emitted="p" if want_proton else "n",
+                emitted_reason=reason,
+                emitted_index=i,
+                emitted_ke_mev=float(_kinetic_in_rest_frame(f)[i].item()) * 1000.0,
+                A_after=a2, Z_after=z2, after_in_table=lut.is_stable(a2, z2),
+            ))
+        step += 1
     return out, n_evaporated
 
 
@@ -172,6 +231,7 @@ class MSTDecayBaseline:
         decay: bool = True,
         emit_rule: str = "hottest",
         type_index: int = 7,
+        trace: bool = False,
     ) -> None:
         self.lut = lut
         self.d_cut = d_cut
@@ -181,6 +241,7 @@ class MSTDecayBaseline:
         self.decay = decay
         self.emit_rule = emit_rule
         self.type_index = type_index
+        self.trace = trace
 
     @torch.no_grad()
     def __call__(self, event: torch.Tensor) -> BaselineResult:
@@ -196,19 +257,27 @@ class MSTDecayBaseline:
         )
 
         fragments: List[torch.Tensor] = []
+        steps: List[DecayStep] = []
         n_evaporated = 0
-        for f in primaries:
+        for j, f in enumerate(primaries):
             if self.decay:
+                frag_trace: Optional[List[DecayStep]] = [] if self.trace else None
                 pieces, n_evap = decay_to_table(
-                    f, self.lut, emit_rule=self.emit_rule, type_index=self.type_index
+                    f, self.lut, emit_rule=self.emit_rule,
+                    type_index=self.type_index, trace=frag_trace,
                 )
                 fragments += pieces
                 n_evaporated += n_evap
+                if frag_trace:
+                    for st in frag_trace:
+                        st.fragment = j
+                    steps += frag_trace
             else:
                 fragments.append(f)
 
         return BaselineResult(
             fragments=fragments,
+            steps=steps,
             n_primary=len(primaries),
             n_primary_in_table=n_in_table,
             n_evaporated=n_evaporated,

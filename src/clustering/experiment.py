@@ -37,6 +37,7 @@ Examples
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import random
 import subprocess
@@ -60,7 +61,7 @@ from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
-from clustering.baselines.mst_decay import BaselineResult, MSTDecayBaseline
+from clustering.baselines.mst_decay import BaselineResult, DecayStep, MSTDecayBaseline
 from clustering.split_prediction.dataset import NucleonDataset, collate_fn
 from clustering.split_prediction.model import SplitPredictionModel, SplitValueCritic
 from clustering.split_prediction.mst import MSTPretrainer
@@ -252,6 +253,10 @@ class ClusteringConfig:
     baseline_p_frame: str = "pair_cm"
     baseline_decay: bool = True
     baseline_emit_rule: str = "hottest"
+    #   baseline_trace: record every evaporation step to baseline_decay_trace.csv
+    #     — one row per emitted nucleon, carrying the parent (A, Z), its table
+    #     verdict, both candidate daughters, and why the channel was chosen.
+    baseline_trace: bool = False
 
     type_index: int = 7
     input_dim: int = 8
@@ -728,8 +733,11 @@ def run_baseline(exp: Ctx) -> None:
         decay=cfg.baseline_decay,
         emit_rule=cfg.baseline_emit_rule,
         type_index=cfg.type_index,
+        trace=cfg.baseline_trace,
     )
     tally = {"n_primary": 0, "n_primary_in_table": 0, "n_evaporated": 0}
+    steps: List[DecayStep] = []
+    seen = [0]  # event counter, in the order _fragment_report walks them
 
     def fragment_fn(event: torch.Tensor) -> BaselineResult:
         # The baseline is numpy/scipy-bound; keep it on the CPU regardless of
@@ -737,6 +745,10 @@ def run_baseline(exp: Ctx) -> None:
         res = baseline(event.cpu())
         for k in tally:
             tally[k] += getattr(res, k)
+        for st in res.steps:
+            st.event = seen[0]
+        steps.extend(res.steps)
+        seen[0] += 1
         return res
 
     exp.fig_prefix = "baseline_"
@@ -744,6 +756,9 @@ def run_baseline(exp: Ctx) -> None:
         _fragment_report(exp, fragment_fn, stage="baseline")
     finally:
         exp.fig_prefix = ""
+
+    if cfg.baseline_trace:
+        _dump_decay_trace(exp, steps)
 
     frac_known = tally["n_primary_in_table"] / max(1, tally["n_primary"])
     print(f"Primary fragments: {tally['n_primary']}  "
@@ -754,6 +769,26 @@ def run_baseline(exp: Ctx) -> None:
     exp.track(tally["n_primary_in_table"], name="primary_fragments_in_table", context=ctx)
     exp.track(frac_known, name="primary_in_table_frac", context=ctx)
     exp.track(tally["n_evaporated"], name="evaporated_nucleons", context=ctx)
+
+
+def _dump_decay_trace(exp: Ctx, steps: "List[DecayStep]") -> None:
+    """Write one row per evaporation step, so the decay rule can be replayed.
+
+    Every column is a quantity the rule actually consulted, in the order it
+    consulted it — parent (A, Z), the table verdicts on both daughters, their
+    Weizsacker binding, which tie-break decided the channel, and which nucleon
+    left.  A row exists only for a fragment that was *not* in the table, which is
+    the whole stopping rule: in the table -> emitted untouched, no row.
+    """
+    fields = [f.name for f in dataclasses.fields(DecayStep)]
+    path = exp.out_dir / "baseline_decay_trace.csv"
+    with path.open("w") as fh:
+        fh.write(",".join(fields) + "\n")
+        for st in steps:
+            fh.write(",".join(
+                f"{getattr(st, f):.4f}" if isinstance(getattr(st, f), float)
+                else str(getattr(st, f)) for f in fields) + "\n")
+    print(f"Saved {path}  ({len(steps)} decay steps)")
 
 
 def _fragment_report(exp: Ctx, fragment_fn, *, stage: str) -> None:
