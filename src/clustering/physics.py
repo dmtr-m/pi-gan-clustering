@@ -51,6 +51,60 @@ def weizsacker_per_nucleon_formula(A: torch.Tensor, Z: torch.Tensor):
     return weizsacker_formula(A, Z) / A
 
 
+# ─── Bethe-Weizsäcker mass formulas as used by SACA 2.1 ───────────────────────
+#
+# Vermani, Dhawan, Goyal, Puri & Aichelin, arXiv:0912.5130, Eqs. (3)-(10).
+# These are the paper's own coefficients and forms, kept separate from
+# ``weizsacker_formula`` above (which the RL reward uses and which has different
+# coefficients, a Z^2 Coulomb term and an A^(-3/4) pairing term).
+#
+# Two differences from the plain BW formula, and only two — the coefficients are
+# identical between them:
+#   * asymmetry is damped at low A by  1 / (1 + exp(-A/17))
+#   * pairing is damped at low A by    (1 - exp(-A/30))
+#
+# Verified against the paper's own worked value: Fe-56 -> 489.4 MeV total,
+# 8.74 MeV/nucleon.  See tests/test_binding_formulas.py.
+BWM_A_V = 15.777   # MeV   volume
+BWM_A_S = 18.34    # MeV   surface
+BWM_A_C = 0.71     # MeV   Coulomb, paired with Z(Z-1) — NOT Z^2
+BWM_A_SYM = 23.21  # MeV   asymmetry
+BWM_A_P = 12.0     # MeV   pairing, paired with A^(-1/2) — NOT A^(-3/4)
+
+
+def bethe_weizsacker(A: torch.Tensor, Z: torch.Tensor,
+                     modified: bool = True) -> torch.Tensor:
+    """Binding energy [MeV], positive for a bound nucleus.
+
+    ``modified=True`` is the BWM form of Samanta & Adhikari that SACA 2.1 uses
+    as its admissibility criterion; ``False`` is the plain BW form.  Note the
+    threshold in SACA is *per nucleon*, so divide by A before comparing with
+    ``zeta``.
+    """
+    A = A.float()
+    Z = Z.float()
+    N = A - Z
+
+    asym_denom = A * (1.0 + torch.exp(-A / 17.0)) if modified else A
+    pairing = BWM_A_P * torch.pow(A, -0.5)
+    if modified:
+        pairing = pairing * (1.0 - torch.exp(-A / 30.0))
+
+    even_even = (torch.remainder(Z, 2) == 0) & (torch.remainder(N, 2) == 0)
+    odd_odd = (torch.remainder(Z, 2) == 1) & (torch.remainder(N, 2) == 1)
+    delta = torch.where(even_even, pairing, torch.zeros_like(A))
+    delta = torch.where(odd_odd, -pairing, delta)
+    # delta is 0 for odd A, which both parity masks already exclude.
+
+    return (
+        BWM_A_V * A
+        - BWM_A_S * torch.pow(A, 2.0 / 3.0)
+        - BWM_A_C * Z * (Z - 1.0) / torch.pow(A, 1.0 / 3.0)
+        - BWM_A_SYM * (A - 2.0 * Z) ** 2 / asym_denom
+        + delta
+    )
+
+
 A_SYM = 23.70  # MeV — Weizsäcker asymmetry coefficient (a_4)
 
 
