@@ -284,6 +284,9 @@ class ClusteringConfig:
     saca_e_cut_light: float = 0.0   # MeV/nucleon, N_f < 3 (Puri & Aichelin)
     saca_p_release: float = 0.3
     saca_two_pass: bool = True
+    saca_asymmetry: bool = False   # FRIGA's B_asy term on top of SACA's energy
+    saca_e_0_asy: float = 23.3     # MeV
+    saca_gamma_asy: float = 1.0
 
     type_index: int = 7
     input_dim: int = 8
@@ -768,6 +771,8 @@ def run_baseline(exp: Ctx) -> None:
             trials_per_nucleon=cfg.saca_trials_per_nucleon, e_cut=cfg.saca_e_cut,
             e_cut_light=cfg.saca_e_cut_light,
             p_release=cfg.saca_p_release, two_pass=cfg.saca_two_pass,
+            asymmetry=cfg.saca_asymmetry, e_0_asy=cfg.saca_e_0_asy,
+            gamma_asy=cfg.saca_gamma_asy,
         )
         print(f"SACA: T {params.t_max} -> {params.t_min} MeV, alpha={params.alpha}, "
               f"{params.trials_per_nucleon} trials/nucleon, "

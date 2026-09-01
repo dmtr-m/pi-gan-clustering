@@ -83,6 +83,22 @@ V_0_YUKAWA = -85.1   # MeV fm
 MU_YUKAWA = 1.0      # fm  (BQMD quotes 1.5, IQMD 0.4; this is the repo's value)
 HBARC = 197.3269804  # MeV fm
 E_SQ = 1.4399644     # MeV fm
+
+# FRIGA's asymmetry term.  SACA's energy is Skyrme + Yukawa + Coulomb, which is
+# isospin-blind apart from Coulomb — and Coulomb only penalizes protons, so
+# nothing pulls a fragment back toward the valley.  FRIGA adds
+#
+#     B_asy = E_0 ((rho_n - rho_p) / rho_B)^2 (<rho_B> / rho_0)^gamma
+#
+# "in contradistinction to SACA in which only the first term is used", and
+# reports that it narrows mass distributions toward N = Z and is "a key
+# ingredient".  For a uniformly mixed cluster (rho_n - rho_p)/rho_B = (N - Z)/A,
+# so this reduces to E_0 (N - Z)^2 / A — the Weizsacker symmetry energy, and
+# E_0 = 23.3 MeV is within 0.5 MeV of that formula's a_sym.  It vanishes
+# identically for N = Z, so it does not touch symmetric nuclear matter or the
+# saturation test.
+E_0_ASY = 23.3       # MeV
+GAMMA_ASY = 1.0      # FRIGA's default; it scans 0.5 / 1 / 1.5
 M_P, M_N = 0.938272, 0.939565   # GeV/c^2
 GEV_TO_MEV = 1000.0
 
@@ -118,10 +134,12 @@ class EnergyTerms:
     skyrme: float = 0.0
     yukawa: float = 0.0
     coulomb: float = 0.0
+    asymmetry: float = 0.0
 
     @property
     def total(self) -> float:
-        return self.kinetic + self.skyrme + self.yukawa + self.coulomb
+        return (self.kinetic + self.skyrme + self.yukawa + self.coulomb
+                + self.asymmetry)
 
 
 def boost_to_rest_frame(p: np.ndarray, E: np.ndarray, r: np.ndarray
@@ -153,6 +171,8 @@ def boost_to_rest_frame(p: np.ndarray, E: np.ndarray, r: np.ndarray
 def cluster_energy(nucleons: np.ndarray, *, eos: str = "soft",
                    rho_0: float = RHO_0, L: float = L_GAUSS,
                    coulomb: bool = True, yukawa: bool = False,
+                   asymmetry: bool = False, e_0_asy: float = E_0_ASY,
+                   gamma_asy: float = GAMMA_ASY,
                    boost: bool = True) -> EnergyTerms:
     """Energy [MeV] of one fragment.  ``nucleons`` is (n, 8): p(3) E x(3) type.
 
@@ -198,6 +218,26 @@ def cluster_energy(nucleons: np.ndarray, *, eos: str = "soft",
     rho = (np.pi * L) ** (-1.5) * np.exp(-d2 / L).sum(1)   # = interaction_density(r, L)
     u = rho / rho_0
     terms.skyrme = float((0.5 * alpha * u + beta / (gam + 1.0) * u ** gam).sum())
+
+    if asymmetry:
+        # Cluster-level isospin asymmetry, times the mean density factor.
+        #
+        # Evaluating (rho_n - rho_p)/rho_B per nucleon from the discrete Gaussian
+        # sums does NOT work: each nucleon's neighbourhood has a fluctuating n/p
+        # balance, the square keeps that shot noise, and it never cancels — the
+        # naive form returns +87.55 MeV for an N = Z Ca-40, where the term must
+        # be identically zero.  FRIGA writes the density factor as <rho_B>, with
+        # averaging brackets, so these are smooth densities; the cluster-level
+        # ratio (N - Z)/A is their discrete counterpart.
+        #
+        # This reduces to E_0 (N - Z)^2 / A at normal density — the Weizsacker
+        # symmetry energy, whose a_sym = 23.2 MeV is within 0.5 MeV of FRIGA's
+        # E_0 = 23.3.  That agreement is the check that the reading is right.
+        n_p = int(is_p.sum())
+        n_n = n - n_p
+        rho_mean = float(rho.mean())
+        terms.asymmetry = (e_0_asy * ((n_n - n_p) / n) ** 2 * n
+                           * (rho_mean / rho_0) ** gamma_asy)
 
     d = np.sqrt(d2)
     # Yukawa and Coulomb are genuine pair sums; 0.5 * full matrix = sum over i<j.

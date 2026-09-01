@@ -79,6 +79,14 @@ class SacaParams:
     e_cut_light: float = 0.0    # MeV/nucleon, fragments with N_f < 3
     p_release: float = 0.3      # probability a pass-1 move is "release to free"
     two_pass: bool = True
+    # FRIGA's asymmetry term, off by default because SACA proper does not have
+    # it ("in contradistinction to SACA in which only the first term is used").
+    # SACA's energy is isospin-blind apart from Coulomb, which penalizes protons
+    # and so drives fragments neutron-rich with nothing pulling back; this is the
+    # term FRIGA adds and calls "a key ingredient" for isotopic widths.
+    asymmetry: bool = False
+    e_0_asy: float = 23.3       # MeV, FRIGA's coefficient
+    gamma_asy: float = 1.0      # FRIGA's default; it scans 0.5 / 1 / 1.5
 
 
 class _SacaEvent:
@@ -93,9 +101,14 @@ class _SacaEvent:
     lab frame biases them by ~+8.6 MeV/nucleon and makes bound ones look free.
     """
 
-    def __init__(self, event: torch.Tensor, type_index: int = 7) -> None:
+    def __init__(self, event: torch.Tensor, type_index: int = 7,
+                 asymmetry: bool = False, e_0_asy: float = 23.3,
+                 gamma_asy: float = 1.0) -> None:
         self.x = event.cpu().numpy().astype(np.float64)
         self.n = event.shape[0]
+        self.asymmetry = asymmetry
+        self.e_0_asy = e_0_asy
+        self.gamma_asy = gamma_asy
         self._cache: Dict[Tuple[int, ...], float] = {}
 
     def fragment_energy(self, idx: np.ndarray) -> float:
@@ -108,7 +121,9 @@ class _SacaEvent:
         key = tuple(sorted(int(i) for i in idx))
         hit = self._cache.get(key)
         if hit is None:
-            hit = cluster_energy(self.x[list(key)]).total
+            hit = cluster_energy(self.x[list(key)], asymmetry=self.asymmetry,
+                                 e_0_asy=self.e_0_asy,
+                                 gamma_asy=self.gamma_asy).total
             self._cache[key] = hit
         return hit
 
@@ -247,7 +262,8 @@ def saca_clusters(
 ) -> SacaResult:
     """Run the full MST -> classify -> anneal -> recombine pipeline on one event."""
     rng = rng or np.random.default_rng()
-    ev = _SacaEvent(event, type_index)
+    ev = _SacaEvent(event, type_index, asymmetry=params.asymmetry,
+                    e_0_asy=params.e_0_asy, gamma_asy=params.gamma_asy)
 
     x = event.unsqueeze(0)
     mask = torch.ones(1, event.shape[0], dtype=torch.bool, device=event.device)
