@@ -85,6 +85,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default="data/xecs_hse.parquet")
     ap.add_argument("--ref", default=None, help="digitized generator .npy (optional)")
+    ap.add_argument("--e-star-ref", default="model", choices=("model", "bwm"),
+                    help="ground state E* is measured against")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -120,7 +122,8 @@ def main():
                 sum_a_out += A
                 sum_z_out += Z
                 continue
-            e_star = excitation_energy(cluster_energy(xn[idx]).total, A, Z)
+            e_star = excitation_energy(cluster_energy(xn[idx]).total, A, Z,
+                                       reference=args.e_star_ref)
             e_star_per_a.append(e_star / A)
             res = evaporate(A, Z, e_star, rng)
             for name, k in res.emitted.items():

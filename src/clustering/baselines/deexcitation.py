@@ -50,6 +50,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from clustering.baselines.qmd_energy import ground_state_zeta
 from clustering.physics import bethe_weizsacker
 
 # Emitted species: (name, A, Z, 2s+1).  GEMINI's light-particle channels.
@@ -199,13 +200,26 @@ def evaporate(A: int, Z: int, e_star: float, rng: np.random.Generator,
     return res
 
 
-def excitation_energy(cluster_total_mev: float, A: int, Z: int) -> float:
+def excitation_energy(cluster_total_mev: float, A: int, Z: int,
+                      reference: str = "model") -> float:
     """E* = (energy as formed) - (ground-state energy) [MeV], floored at 0.
 
-    The ground state is ``-B(A, Z)`` from the mass formula.  Clusters that come
-    out *below* it are treated as cold rather than as having negative
-    excitation — FRIGA does the same, noting that a semi-classical model
-    over-binds because "the ground state of the quantum hamiltonian is higher
-    than the ground state of the classical hamiltonian".
+    ``reference``:
+      * ``"model"`` (default) — the ground state of the *same* energy model,
+        from ``qmd_energy.ground_state_zeta``.  This is the physically correct
+        choice: E* is excitation above the minimum of the Hamiltonian being used.
+      * ``"bwm"`` — the mass formula's ``-B(A, Z)``.  Mixes two energy scales:
+        our model is shallower than BWM by +2.73 MeV/nucleon at A=16 down to
+        +0.64 at A=80 (mean +1.41), and referencing E* to BWM charges that whole
+        gap to the excitation, so every fragment comes out spuriously hot.
+
+    Clusters below their ground state are treated as cold rather than as having
+    negative excitation — FRIGA does the same, noting that a semi-classical
+    model over-binds because "the ground state of the quantum hamiltonian is
+    higher than the ground state of the classical hamiltonian".
     """
-    return max(0.0, cluster_total_mev + binding(A, Z))
+    if reference == "bwm":
+        return max(0.0, cluster_total_mev + binding(A, Z))
+    if reference != "model":
+        raise ValueError(f"unknown reference {reference!r}; expected 'model' or 'bwm'")
+    return max(0.0, cluster_total_mev - A * ground_state_zeta(A, Z))

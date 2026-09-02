@@ -256,3 +256,52 @@ def zeta(nucleons: np.ndarray, **kw) -> float:
     if n == 0:
         return 0.0
     return cluster_energy(nucleons, **kw).total / n
+
+
+_GS_CACHE: Dict[Tuple[int, int], float] = {}
+
+
+def ground_state_zeta(A: int, Z: int, seeds: int = 3) -> float:
+    """Energy per nucleon [MeV] of the (A, Z) ground state *in this model*.
+
+    Built by constructing a cold nucleus — uniform sphere, Fermi sphere at the
+    density's own p_F — and taking the lowest energy over a density scan.
+
+    Why this exists: excitation energy must be measured against the ground state
+    of the same Hamiltonian.  Referencing it to the BWM mass formula instead
+    charges this model's under-binding to E*.  Measured gap, our ground state
+    minus BWM's: +2.73 MeV/nucleon at A=16 falling to +0.64 at A=80, mean +1.41.
+    """
+    key = (int(A), int(Z))
+    hit = _GS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if A < 2:
+        _GS_CACHE[key] = 0.0
+        return 0.0
+
+    best = float("inf")
+    for rho_f in (0.7, 0.85, 1.0, 1.2, 1.5):
+        rho = rho_f * RHO_0
+        radius = (3.0 * A / (4.0 * np.pi * rho)) ** (1.0 / 3.0)
+        p_f = fermi_momentum(rho)
+        vals = []
+        for seed in range(seeds):
+            rng = np.random.default_rng(seed)
+
+            def in_ball(scale):
+                u = rng.random(A) ** (1.0 / 3.0)
+                d = rng.normal(size=(A, 3))
+                d /= np.linalg.norm(d, axis=1, keepdims=True)
+                return d * (u * scale)[:, None]
+
+            r = in_ball(radius)
+            p = in_ball(p_f)
+            types = np.concatenate([np.ones(Z), -np.ones(A - Z)])
+            m = np.where(types > 0, M_P, M_N)
+            E = np.sqrt((p ** 2).sum(1) + m ** 2)
+            x = np.column_stack([p, E, r, types])
+            vals.append(cluster_energy(x).total / A)
+        best = min(best, float(np.mean(vals)))
+    _GS_CACHE[key] = best
+    return best
