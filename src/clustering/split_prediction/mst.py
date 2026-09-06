@@ -69,7 +69,9 @@ P_FRAME = "pair_cm"   # frame the relative momentum is measured in: "pair_cm" | 
 # SpectatorsLeft, over pairs already within d_cut = 2 fm:
 #     p_cut [MeV/c]   100    150    200    250    300    400
 #     frac kept       0.045  0.121  0.241  0.399  0.567  0.846
-# so MSTp at the literature 250 MeV/c would drop ~60% of the spatial bonds.
+# so MSTp at 250 MeV/c would drop ~60% of the spatial bonds.  NB 250 is this
+# repo's own default, not a published value: Kireyeu uses 0.285 / 0.3 GeV/c,
+# FRIGA 0.6 GeV/c, and Puri & Aichelin's 200 MeV/c is a pre-cut, not this cut.
 #
 # Every MST warm-start run to date therefore used coordinate-only labels, and
 # the d_cut percolation scan documented above was measured that way.  Keeping

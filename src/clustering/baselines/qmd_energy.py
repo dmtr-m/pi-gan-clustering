@@ -75,8 +75,12 @@ RHO_0 = 0.15         # fm^-3, BQMD
 # choice (the minimum sits at rho_0 for all three), but finite nuclei are not:
 # sqrt(L) is the smearing length, and at 8.66 it is 2.9 fm against a 3.9 fm
 # radius for Ca-40, so a light nucleus becomes all surface.  Measured zeta for
-# Ca-40: -4.18 at L = 2.16, -1.89 at 4.33, +2.51 at 8.66.  PHQMD's value is both
-# the best behaved here and the one paired with rho_0 = 0.168 below.
+# Ca-40: -4.18 at L = 2.16, -1.89 at 4.33, +2.51 at 8.66.  NOTE this leaves the
+# set mixed: alpha/beta/gamma and rho_0 are BQMD's, whose own L is 4.33, while
+# 2.16 is PHQMD's.  It is kept because bulk saturation is insensitive to L (the
+# minimum sits at rho_0 either way) and finite nuclei are much better at 2.16 —
+# but it is a deviation, and PHQMD's density normalisation factor C that would
+# accompany its L is not implemented.
 L_GAUSS = 2.16       # fm^2, PHQMD
 
 V_0_YUKAWA = -85.1   # MeV fm

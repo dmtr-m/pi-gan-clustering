@@ -20,9 +20,14 @@ fragment that is just
 
     E_f = SUM_a T_a(rest frame)  +  SUM_{a<b} V_ab
 
-which is what ``_SacaEvent.fragment_energy`` computes.  ``V`` is this repo's QMD
-potential (Skyrme + Yukawa + Coulomb + Pauli, each in the pair rest frame) — the
-same potential the RL reward uses, so the two are on one scale.
+which is what ``_SacaEvent.fragment_energy`` computes.  ``V`` comes from
+``qmd_energy.cluster_energy``: Skyrme in the interaction density plus Coulomb,
+evaluated in the **fragment** rest frame, with Yukawa and
+the FRIGA asymmetry term off by default and no Pauli or momentum-dependent term.
+That is deliberately **not** the potential the RL reward uses — ``physics.py``'s
+pairwise Skyrme+Yukawa+Coulomb+Pauli does not saturate, and SACA minimizes its
+energy directly, so it would exploit that.  See ``qmd_energy``'s docstring and
+``tests/test_qmd_energy.py``.
 
 A singleton contributes exactly zero: with ``N_f = 1`` the momentum relative to
 the fragment is zero and there are no pairs.  Free nucleons are therefore
