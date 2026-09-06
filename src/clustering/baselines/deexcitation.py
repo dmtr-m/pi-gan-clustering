@@ -114,21 +114,31 @@ def separation_energy(A: int, Z: int, a_v: int, z_v: int) -> float:
     return binding(A, Z) - binding(A - a_v, Z - z_v) - binding(a_v, z_v)
 
 
-def coulomb_barrier(A_d: int, Z_d: int, a_v: int, z_v: int) -> float:
-    """Coulomb barrier seen by a charged emitted particle [MeV].  0 for neutrons."""
+def coulomb_barrier(A_d: int, Z_d: int, a_v: int, z_v: int,
+                    barrier_factor: float = BARRIER_FACTOR) -> float:
+    """Coulomb barrier seen by a charged emitted particle [MeV].  0 for neutrons.
+
+    ``barrier_factor`` scales the classical barrier.  1.0 is the full classical
+    value; below that stands in for tunnelling, which lets charged particles out
+    more easily than classical mechanics allows.  It is the knob that sets how
+    *selectively* the evaporation sheds neutrons: a stiffer barrier suppresses
+    p / d / alpha emission, so the matter thrown away gets more neutron-rich.
+    """
     if z_v == 0 or Z_d <= 0:
         return 0.0
     r = R_0 * (A_d ** (1.0 / 3.0) + a_v ** (1.0 / 3.0))
-    return BARRIER_FACTOR * Z_d * z_v * E_SQ / r
+    return barrier_factor * Z_d * z_v * E_SQ / r
 
 
 def _width_and_spectrum(A: int, Z: int, e_star: float, a_v: int, z_v: int,
-                        g_v: int) -> Tuple[float, np.ndarray, np.ndarray]:
+                        g_v: int, barrier_factor: float = BARRIER_FACTOR
+                        ) -> Tuple[float, np.ndarray, np.ndarray]:
     """(width, eps grid, unnormalized spectrum) for one channel."""
     A_d, Z_d = A - a_v, Z - z_v
     if A_d < 1 or Z_d < 0 or Z_d > A_d:
         return 0.0, np.empty(0), np.empty(0)
-    e_max = e_star - separation_energy(A, Z, a_v, z_v) - coulomb_barrier(A_d, Z_d, a_v, z_v)
+    e_max = (e_star - separation_energy(A, Z, a_v, z_v)
+             - coulomb_barrier(A_d, Z_d, a_v, z_v, barrier_factor))
     if e_max <= 1e-9:
         return 0.0, np.empty(0), np.empty(0)
 
@@ -155,7 +165,8 @@ class DecayResult:
 
 
 def evaporate(A: int, Z: int, e_star: float, rng: np.random.Generator,
-              max_steps: int = 400) -> DecayResult:
+              max_steps: int = 400,
+              barrier_factor: float = BARRIER_FACTOR) -> DecayResult:
     """Run the evaporation chain on one hot fragment.
 
     Returns every product, the residue included.  ``A`` strictly decreases on
@@ -171,7 +182,8 @@ def evaporate(A: int, Z: int, e_star: float, rng: np.random.Generator,
     for _ in range(max_steps):
         widths, grids, spectra, chans = [], [], [], []
         for name, a_v, z_v, g_v in CHANNELS:
-            w, eps, spec = _width_and_spectrum(A, Z, e_star, a_v, z_v, g_v)
+            w, eps, spec = _width_and_spectrum(A, Z, e_star, a_v, z_v, g_v,
+                                               barrier_factor)
             if w > 0.0:
                 widths.append(w); grids.append(eps); spectra.append(spec)
                 chans.append((name, a_v, z_v))
@@ -187,7 +199,7 @@ def evaporate(A: int, Z: int, e_star: float, rng: np.random.Generator,
 
         A_d, Z_d = A - a_v, Z - z_v
         e_star = (e_star - separation_energy(A, Z, a_v, z_v)
-                  - coulomb_barrier(A_d, Z_d, a_v, z_v) - eps)
+                  - coulomb_barrier(A_d, Z_d, a_v, z_v, barrier_factor) - eps)
         A, Z = A_d, Z_d
         res.products.append((a_v, z_v))
         res.emitted[name] = res.emitted.get(name, 0) + 1
