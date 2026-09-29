@@ -237,6 +237,13 @@ class ClusteringConfig:
     energy_scale: str = "extensive"
     bwm_weight: float = 1.0
     bwm_form: str = "bwm"
+    # "zeta_correct" = the SACA paper's full zeta (kinetic + Skyrme 2/3-body +
+    # Yukawa + Coulomb + Pauli) + bwm_weight·(−B_BWM); bwm_form is ignored (BWM).
+    # zeta_spin_factor scales the Pauli term (no spin in the data: 1.0 = all
+    # same-isospin pairs same-spin, 0.5 = random-spin average); zeta_yukawa is
+    # "folded" | "point" | "off".  See baselines/qmd_full.py and FORMULAS.md 5a.
+    zeta_spin_factor: float = 0.5
+    zeta_yukawa: str = "folded"
 
     # Actor-Critic: DeepSets V(s) replaces the scalar EMA baseline.
     # use_critic=false is a pure config flip to raw REINFORCE (no code fork).
@@ -496,6 +503,8 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         energy_scale=cfg.energy_scale,
         bwm_weight=cfg.bwm_weight,
         bwm_form=cfg.bwm_form,
+        zeta_spin_factor=cfg.zeta_spin_factor,
+        zeta_yukawa=cfg.zeta_yukawa,
     )
     history = trainer.train(n_epochs=cfg.split_epochs)
     torch.save(model.state_dict(), exp.dm_model_path)
@@ -1315,6 +1324,10 @@ def main(cfg: DictConfig) -> None:
     if cfg.reward_type in ("qmd_minus_b", "saca_qmd_minus_b"):
         aim_run.add_tag(f"binding:{cfg.bwm_form}")
         aim_run.add_tag(f"lambda:{cfg.bwm_weight:g}")
+    if cfg.reward_type == "zeta_correct":
+        aim_run.add_tag(f"lambda:{cfg.bwm_weight:g}")
+        aim_run.add_tag(f"spin:{cfg.zeta_spin_factor:g}")
+        aim_run.add_tag(f"yukawa:{cfg.zeta_yukawa}")
 
     exp = Ctx(cfg, out_dir, aim_run)
     try:

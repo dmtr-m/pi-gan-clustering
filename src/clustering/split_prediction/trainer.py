@@ -16,6 +16,7 @@ from clustering.physics import (
     weizsacker_qmd_energy,
     qmd_minus_b_energy,
     saca_qmd_minus_b_energy,
+    zeta_correct_energy,
 )
 from clustering.split_prediction.model import SplitPredictionModel
 
@@ -491,6 +492,8 @@ class KSplitTrainer:
         energy_scale: str = "extensive",
         bwm_weight: float = 1.0,
         bwm_form: str = "bwm",
+        zeta_spin_factor: float = 0.5,
+        zeta_yukawa: str = "folded",
     ) -> None:
         self.model = model.to(device)
         self.critic = critic.to(device) if critic is not None else None
@@ -536,8 +539,21 @@ class KSplitTrainer:
         #                    (qmd_energy.cluster_energy: saturating Skyrme, plus the
         #                    rest-frame kinetic term) rather than on physics.py's
         #                    non-saturating potential.  See saca_qmd_minus_b_energy.
+        #   "zeta_correct"   the SACA paper's full zeta (rest-frame kinetic + Skyrme 2/3-body
+        #                    + Yukawa + Coulomb + Pauli) + bwm_weight·(−B_BWM); the same
+        #                    energy as SacaParams(energy_model="zeta_correct").  See
+        #                    zeta_correct_energy.
         if reward_type == "qmd_asym":
             self.energy_fn = fragment_energy
+        elif reward_type == "zeta_correct":
+            if zeta_yukawa not in ("folded", "point", "off"):
+                raise ValueError(
+                    f"unknown zeta_yukawa {zeta_yukawa!r}; expected 'folded', 'point' or 'off'"
+                )
+            self.energy_fn = partial(
+                zeta_correct_energy, bwm_weight=bwm_weight,
+                spin_factor=zeta_spin_factor, yukawa=zeta_yukawa,
+            )
         elif reward_type == "weizsacker_qmd":
             if energy_scale not in ("extensive", "per_nucleon"):
                 raise ValueError(
@@ -557,7 +573,7 @@ class KSplitTrainer:
         else:
             raise ValueError(
                 f"unknown reward_type {reward_type!r}; expected 'qmd_asym', "
-                f"'weizsacker_qmd', 'qmd_minus_b' or 'saca_qmd_minus_b'"
+                f"'weizsacker_qmd', 'qmd_minus_b', 'saca_qmd_minus_b' or 'zeta_correct'"
             )
         self.reward_type = reward_type
         self.energy_scale = energy_scale

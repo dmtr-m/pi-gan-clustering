@@ -9,6 +9,7 @@ import numpy as np
 # energy the SACA baselines minimize, and saca_qmd_minus_b_energy below
 # exposes it as a reward so the annealer and the policy can share one.
 from clustering.baselines.qmd_energy import cluster_energy
+from clustering.baselines.qmd_full import full_cluster_energy
 
 
 def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor):
@@ -535,6 +536,50 @@ def saca_qmd_minus_b_energy(
             A_t, Z_t = torch.tensor([float(A)]), torch.tensor([float(Z)])
             B = float(bethe_weizsacker(A_t, Z_t, modified=True) if binding == "bwm"
                       else weizsacker_formula(A_t, Z_t))
+            e = e - bwm_weight * B
+        out[b] = e
+    return torch.as_tensor(out, dtype=nucleons.dtype, device=nucleons.device)
+
+
+def zeta_correct_energy(
+    nucleons: torch.Tensor,
+    mask: torch.Tensor,
+    type_index: int = 7,
+    bwm_weight: float = 1.0,
+    spin_factor: float = 0.5,
+    yukawa: str = "folded",
+) -> torch.Tensor:
+    """The SACA paper's zeta with the full QMD, plus a Weizsacker term, as a reward.
+
+    ``E(f) = T + V_Sk2 + V_Sk3 + V_Yuk + V_Coul + V_Pau + lambda * bwd(A, Z)``,
+    with ``bwd = -B_BWM`` (negative when bound), everything in the fragment rest
+    frame.  This is exactly ``SacaParams(energy_model="zeta_correct")`` — the
+    energy is ``baselines.qmd_full.full_cluster_energy`` and B is
+    ``bethe_weizsacker(modified=True)`` — so the annealer and the policy
+    minimize the same quantity (FORMULAS.md 5, 5a).  The split reward built on
+    it is, as for every reward here, ``q = (E_parent - sum E_child) / N_parent``.
+
+    ``spin_factor`` and ``yukawa`` are the two modelling readings documented in
+    ``qmd_full`` (no spin in the dataset; Yukawa point vs Gaussian-folded).  The
+    defaults are the ones behind the ``az_zeta_correct_yukawa_*`` figures.
+
+    Not differentiable (numpy), which is fine: the reward is detached before the
+    loss.  A set with no nucleons scores 0, a single nucleon scores 0, and B is 0
+    below A = 2, as in ``saca_qmd_minus_b_energy``.
+    """
+    x = nucleons.detach().cpu().double().numpy()
+    m = mask.detach().cpu().numpy()
+    out = np.zeros(x.shape[0], dtype=np.float64)
+    for b in range(x.shape[0]):
+        sub = x[b][m[b]]
+        A = sub.shape[0]
+        if A < 2:
+            continue
+        e = full_cluster_energy(sub, spin_factor=spin_factor, yukawa=yukawa).total
+        if bwm_weight != 0.0:
+            Z = int((sub[:, type_index] == 1).sum())
+            B = float(bethe_weizsacker(torch.tensor([float(A)]),
+                                       torch.tensor([float(Z)]), modified=True))
             e = e - bwm_weight * B
         out[b] = e
     return torch.as_tensor(out, dtype=nucleons.dtype, device=nucleons.device)
