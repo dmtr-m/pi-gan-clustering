@@ -5,6 +5,11 @@ import torch.nn as nn
 
 import numpy as np
 
+# Acyclic: qmd_energy imports numpy only, never this module.  It is the
+# energy the SACA baselines minimize, and saca_qmd_minus_b_energy below
+# exposes it as a reward so the annealer and the policy can share one.
+from clustering.baselines.qmd_energy import cluster_energy
+
 
 def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor):
     """Weizsäcker semi-empirical binding energy B(A, Z) [MeV] (extensive).
@@ -379,6 +384,160 @@ def weizsacker_qmd_energy(
     else:
         raise ValueError(f"unknown scale {scale!r}; expected 'extensive' or 'per_nucleon'")
     return qmd_weight * V - W
+
+
+def qmd_minus_b_energy(
+    nucleons: torch.Tensor,
+    mask: torch.Tensor,
+    type_index: int = 7,
+    bwm_weight: float = 1.0,
+    binding: str = "bwm",
+) -> torch.Tensor:
+    """Per-fragment energy of the SACA "QMD - B" objective:  ``E = V - w*B``.
+
+    This is the baseline objective from ``experiments/qmd_minus_b.py``
+    (``energy_model="qmd_minus_b"`` in ``SacaParams``) carried over to the RL
+    reward, so the divisive slot-attention policy and the annealer minimize the
+    same quantity.  ``V`` is the extensive QMD pairwise potential and ``B`` the
+    mass-formula binding energy, positive for a bound nuclide, so subtracting it
+    credits binding twice: once microscopically, once phenomenologically.  The
+    split reward ``q = (E_parent - sum E_child) / N`` therefore rewards cutting
+    weak or repulsive bonds *and* leaving behind fragments that sit on the
+    stability valley.
+
+    Two things differ from ``weizsacker_qmd_energy``, which has the same shape
+    (``qmd_weight*V - W``) and is *not* changed by this function:
+
+    * **which mass formula.**  ``binding="bwm"`` is ``bethe_weizsacker(...,
+      modified=True)`` — the Samanta-Adhikari form SACA 2.1 uses and the one the
+      QMD - B baseline ran on.  ``binding="bw"`` is ``weizsacker_formula``, what
+      the ``weizsacker_qmd`` reward uses.  They are interchangeable above A ~ 9
+      and very different below it; see the table below.
+    * **where the weight sits.**  The baseline scans lambda on *B*
+      (``bwm_weight``), not on V, so lambda = 0 degenerates to the plain QMD
+      potential rather than to minus the mass formula.  ``binding="bw"`` with
+      ``bwm_weight=1`` reproduces ``weizsacker_qmd_energy(scale="extensive",
+      qmd_weight=1)`` exactly; ``tests/test_qmd_minus_b.py`` asserts it.
+
+    **The two formulas disagree where this model lives.**  B [MeV], against the
+    experimental value where the nuclide exists:
+
+        nuclide     A   Z       BW      BWM      exp
+        d           2   1   -17.54    +1.89     2.22
+        t           3   1    +1.83    +4.97     8.48
+        He-4        4   2   +28.38   +16.75    28.30
+        H-4         4   1   -18.02    +3.18    (does not exist)
+        3n          3   0   -60.88   -28.70    (does not exist)
+        Li-7        7   3   +38.38   +39.11    39.24
+        Fe-56      56  26  +490.72  +489.40   492.25
+
+    So the swap is **not** a uniform improvement, and should not be sold as one:
+
+    * BW declares the deuteron unbound by 17.5 MeV.  Under ``weizsacker_qmd``
+      the reward is therefore actively hostile to deuterons, which is worth
+      knowing given that A = 2-4 comes out at ~0.55x in every clusterizer here.
+      BWM puts it at +1.89 against 2.22 measured.
+    * BWM underbinds He-4 by 11.6 MeV, where BW happens to land within 0.1 MeV
+      of experiment (its A^(-3/4) pairing term is large, and even-even alpha is
+      the case that flatters).
+    * BWM calls H-4 bound (+3.18) — a nuclide that does not exist — and halves
+      BW's penalty on neutron blobs.  BW's harshness there is a feature, not an
+      accident, for a source that arrives at Z/A = 0.41.
+
+    **B is extensive, so lambda is a collapse knob.**  Measured on the annealer
+    (``figures/az_qmd_minus_b.png``, 1000 collisions): as lambda goes
+    0.25 -> 0.5 -> 1 -> 1.5 the fragment multiplicity falls 3.73 -> 3.44 ->
+    2.69 -> 2.20 per collision, bound mass climbs 127 -> 141 against a target of
+    102.8, and the 7-bin mass RMS degrades 0.632 -> 0.973.  What it buys is
+    composition: the A-Z band comes out narrow and on the valley, where the
+    opposite sign (``qmd_plus_b``) scatters off it.  Expect the same trade here
+    — the reward's global optimum is already "do not split" (q = 0 for the
+    single-leaf partition), and -w*B deepens that minimum.
+
+    B = 0 for A < 2: the liquid-drop picture is meaningless for a free nucleon,
+    and ``V`` already returns 0 for a set with no pairs.
+    """
+    if binding not in ("bwm", "bw"):
+        raise ValueError(f"unknown binding {binding!r}; expected 'bwm' or 'bw'")
+    A = mask.sum(dim=1).float()                                       # (B,)
+    Z = ((nucleons[..., type_index] == 1) & mask).sum(dim=1).float()  # (B,)
+    B = torch.zeros_like(A)
+    big = A >= 2
+    if big.any():
+        B[big] = (bethe_weizsacker(A[big], Z[big], modified=True) if binding == "bwm"
+                  else weizsacker_formula(A[big], Z[big]))
+    return total_potential_energy(nucleons, mask) - bwm_weight * B
+
+
+def saca_qmd_minus_b_energy(
+    nucleons: torch.Tensor,
+    mask: torch.Tensor,
+    type_index: int = 7,
+    bwm_weight: float = 1.0,
+    binding: str = "bwm",
+    eos: str = "soft",
+    yukawa: bool = False,
+    asymmetry: bool = False,
+) -> torch.Tensor:
+    """QMD - B on the **baselines'** QMD energy:  ``E = zeta_QMD*A - w*B``.
+
+    ``qmd_minus_b_energy`` above ports the baseline's *B* term onto the reward's
+    existing potential.  This one ports the whole objective: the energy is
+    ``clustering.baselines.qmd_energy.cluster_energy``, which is what
+    ``experiments/qmd_minus_b.py`` and the SACA annealer actually minimize.
+    The two differ in ways that are not cosmetic — measured on coordinate-MST
+    fragments of real events:
+
+        fragment          V (physics.py)   E (qmd_energy)
+        A=126 Z=51            -33.4 MeV/A       -7.75 MeV/A
+        A=105 Z=43            -36.8             -6.25
+        A=4   Z=0 (4n)        -19.6             +10.34
+        A=2   Z=2 (2p)         -3.65            +7.80
+
+    ``physics.py``'s potential is Skyrme(two-body) + Yukawa + Coulomb + Pauli
+    with **no density-dependent Skyrme term**, so nothing opposes compression:
+    it over-binds the residue by roughly a factor of four against the empirical
+    -8 MeV/nucleon, and it binds four free neutrons at -19.6 MeV/nucleon.
+    ``tests/test_nuclear_matter.py`` fails on it for exactly this reason and
+    always has — the density-dependent term was added to ``qmd_energy.py`` for
+    the baselines and never to the reward.  ``cluster_energy`` also carries the
+    internal kinetic energy in the fragment rest frame, which the reward's
+    potential-only V omits entirely.
+
+    Cost is not the reason to prefer one: measured at A = 130, ``cluster_energy``
+    takes 318 us per fragment against 315 us per event for the batched torch
+    potential.  It is numpy and **not differentiable**, which is fine — the split
+    reward is detached before it reaches the loss (REINFORCE differentiates only
+    log pi), so no gradient ever flowed through the energy anyway.
+
+    Sign convention matches the rest of the reward: lower is more bound, and the
+    split reward is ``q = (E_parent - sum E_child) / N_parent``.  A set with no
+    real nucleons scores 0; a single nucleon scores 0 too (its rest-frame
+    kinetic energy vanishes identically and it has no interaction partner).
+
+    ``eos``/``yukawa``/``asymmetry`` are passed through to ``cluster_energy``;
+    its defaults are the self-consistent BQMD set (see its docstring on why
+    Yukawa is off).
+    """
+    if binding not in ("bwm", "bw"):
+        raise ValueError(f"unknown binding {binding!r}; expected 'bwm' or 'bw'")
+    x = nucleons.detach().cpu().double().numpy()
+    m = mask.detach().cpu().numpy()
+    out = np.zeros(x.shape[0], dtype=np.float64)
+    for b in range(x.shape[0]):
+        sub = x[b][m[b]]
+        if sub.shape[0] == 0:
+            continue
+        e = cluster_energy(sub, eos=eos, yukawa=yukawa, asymmetry=asymmetry).total
+        A = sub.shape[0]
+        if A >= 2 and bwm_weight != 0.0:
+            Z = int((sub[:, type_index] == 1).sum())
+            A_t, Z_t = torch.tensor([float(A)]), torch.tensor([float(Z)])
+            B = float(bethe_weizsacker(A_t, Z_t, modified=True) if binding == "bwm"
+                      else weizsacker_formula(A_t, Z_t))
+            e = e - bwm_weight * B
+        out[b] = e
+    return torch.as_tensor(out, dtype=nucleons.dtype, device=nucleons.device)
 
 
 def _calculate_skyrme_potential(

@@ -215,9 +215,28 @@ class ClusteringConfig:
     # energy_scale (weizsacker_qmd only): "extensive" (total B + total pairwise
     # QMD, additive — resists over-splitting) or "per_nucleon" (B/A + mean
     # pairwise, the affinity scale that tends to over-split).
+    # "qmd_minus_b" = V − bwm_weight·B, the SACA annealer's QMD − B objective
+    # (experiments/qmd_minus_b.py) on the divisive policy.  bwm_form picks the
+    # mass formula: "bwm" is SACA 2.1's Samanta-Adhikari form, "bw" is the plain
+    # Weizsäcker the weizsacker_qmd reward uses.  They differ only below A ~ 9,
+    # and that is exactly where this model's fragments are — BW calls the
+    # deuteron unbound by 17.5 MeV, BWM puts it at +1.89 (2.22 measured), while
+    # BWM calls the non-existent H-4 bound.  See qmd_minus_b_energy.
+    # On the annealer, λ = bwm_weight is a collapse knob: 0.25 → 1.5 took
+    # multiplicity 3.73 → 2.20 per collision.  Sweep it, e.g.
+    # --multirun bwm_weight=0.25,0.5,1.0,1.5.
+    # "saca_qmd_minus_b" = the same objective on the *baselines'* QMD energy
+    # (qmd_energy.cluster_energy) instead of physics.py's potential, which has no
+    # density-dependent Skyrme term and does not saturate.  Measured on MST
+    # fragments the two differ by ~21 MeV/nucleon, and under physics.py's V the
+    # best classical clusterizer (MSTp) scores within 10% of a random partition;
+    # under the baselines' energy the gap is 53x.  See saca_qmd_minus_b_energy
+    # and experiments/reward_probe.py.
     reward_type: str = "weizsacker_qmd"
     qmd_weight: float = 1.0
     energy_scale: str = "extensive"
+    bwm_weight: float = 1.0
+    bwm_form: str = "bwm"
 
     # Actor-Critic: DeepSets V(s) replaces the scalar EMA baseline.
     # use_critic=false is a pure config flip to raw REINFORCE (no code fork).
@@ -475,6 +494,8 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         reward_type=cfg.reward_type,
         qmd_weight=cfg.qmd_weight,
         energy_scale=cfg.energy_scale,
+        bwm_weight=cfg.bwm_weight,
+        bwm_form=cfg.bwm_form,
     )
     history = trainer.train(n_epochs=cfg.split_epochs)
     torch.save(model.state_dict(), exp.dm_model_path)
@@ -1291,6 +1312,9 @@ def main(cfg: DictConfig) -> None:
     aim_run.add_tag(f"reward:{cfg.reward_type}")
     if cfg.reward_type == "weizsacker_qmd":
         aim_run.add_tag(f"scale:{cfg.energy_scale}")
+    if cfg.reward_type in ("qmd_minus_b", "saca_qmd_minus_b"):
+        aim_run.add_tag(f"binding:{cfg.bwm_form}")
+        aim_run.add_tag(f"lambda:{cfg.bwm_weight:g}")
 
     exp = Ctx(cfg, out_dir, aim_run)
     try:

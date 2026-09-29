@@ -60,6 +60,8 @@ import numpy as np
 import torch
 
 from clustering.baselines.qmd_energy import cluster_energy
+from clustering.baselines.qmd_full import SPIN_FACTOR, YUKAWA, full_cluster_energy
+from clustering.physics import bethe_weizsacker, pairwise_potential_matrix
 from clustering.split_prediction.mst import D_CUT, P_CUT, P_FRAME, mst_clusters
 
 MASS_PROTON = 0.938272   # GeV/c^2
@@ -74,6 +76,13 @@ class SacaParams:
     t_min: float = 0.5
     alpha: float = 0.9          # geometric cooling, T <- alpha * T
     trials_per_nucleon: int = 4  # trials at each temperature = this * N
+    # How T falls from t_max to t_min.  "geometric" is T <- alpha T (the paper's
+    # schedule, and the default).  "linear" is T <- T - (t_max - t_min)/n_steps, so
+    # it takes exactly n_steps temperature steps and ``alpha`` is unused.  Linear
+    # spends most of its steps at high T on a log scale and few near t_min, the
+    # opposite of geometric, which spends equally many per decade.
+    cooling: str = "geometric"  # "geometric" | "linear"
+    n_steps: int = 90
     # Puri & Aichelin's admissibility criterion (ALPHAXIV_FORMULA_CONVERSATION.md):
     # zeta < L_be with L_be = -4 MeV/nucleon for N_f >= 3 and L_be = 0 below that.
     # The size split is not cosmetic — a real deuteron is bound at -1.1
@@ -92,6 +101,77 @@ class SacaParams:
     asymmetry: bool = False
     e_0_asy: float = 23.3       # MeV, FRIGA's coefficient
     gamma_asy: float = 1.0      # FRIGA's default; it scans 0.5 / 1 / 1.5
+    # SACA 2.1 (Vermani et al.): the constant admissibility cut is replaced by
+    # the fragment's *own* BWM binding energy per nucleon, so the threshold
+    # depends on (A, Z) instead of being flat.  "constant" keeps SACA 1.1.
+    #
+    # The paper never writes the 2.1 inequality — it says only "instead of a
+    # constant -4 MeV/nucleon binding energy", and its Eq. (7) is a total energy
+    # while the criterion is per nucleon.  The reading used here, flagged in
+    # papers/notes/saca_realistic_binding.md as an inference rather than a
+    # quotation, is  zeta < -bwm_scale * B_BWM(A, Z) / A.  The N_f <= 2 special
+    # case is also unstated; e_cut_light still applies, as in 1.1.
+    # Which quantity the admissibility test compares against, and to what.
+    #   "constant"   zeta_QMD < e_cut                    (SACA 1.1)
+    #   "bwm"        zeta_QMD < -bwm_scale B(A,Z)/A      (SACA 2.1)
+    #   "objective"  zeta of the *annealing objective* < e_cut, i.e. the same
+    #                B-corrected quantity the search minimizes rather than the
+    #                bare QMD energy.  Its scale is different — with
+    #                "qmd_minus_b" it runs ~ -14 MeV/nucleon, not ~ -6 — so
+    #                e_cut has to be rescaled with it.
+    e_cut_model: str = "constant"   # "constant" | "bwm" | "objective"
+    bwm_scale: float = 1.0          # 1.0 = the full BWM binding, as published
+    # What the annealing minimizes.  B is the BWM binding energy, positive for a
+    # bound nuclide; the BWM *energy* is -B.  The two signs are different
+    # objectives, not a convention detail:
+    #
+    #   "qmd"          sum_f E_QMD(f).  SACA proper: maximize binding.  Binding
+    #                  is extensive, which is why it collapses onto one residue.
+    #   "qmd_plus_b"   sum_f [E_QMD(f) + w B_f] = QMD - E_BWM: the excitation
+    #                  above the liquid-drop ground state.  Prefers *cold*
+    #                  fragments.  Beware: at fixed A, B is smallest furthest
+    #                  from the valley, so this actively rewards exotic
+    #                  nuclides — measured, it makes more dineutrons than
+    #                  deuterons.
+    #   "qmd_minus_b"  sum_f [E_QMD(f) - w B_f]: credits binding twice, once
+    #                  microscopically and once from the mass formula.  At fixed
+    #                  A this is maximized *on* the valley, so it pulls the
+    #                  opposite way to qmd_plus_b on composition.
+    #
+    # `bwm_weight` (w) mixes with plain SACA: w = 0 is "qmd" for either model.
+    #
+    # Three more, which swap or blend the *microscopic* term (baselines_comparison.py):
+    #
+    #   "physics_v"          sum_f V_f: the pairwise potential of physics.py (Skyrme +
+    #                        Yukawa + Coulomb + Pauli, no fragment-frame kinetic
+    #                        term) — the RL reward's "QMD" energy — in place of
+    #                        qmd_energy.cluster_energy.
+    #   "physics_v_minus_b"  sum_f [V_f - w B_f]: the same, with BWM binding credited
+    #                        (the qmd_minus_b reward on the annealer).
+    #   "mix"                sum_f [alpha E_f - (1 - alpha) B_f] with E_f the
+    #                        cluster_energy of the default model; alpha = 1 is plain
+    #                        SACA, alpha = 0 is the mass formula alone.  Per
+    #                        nucleon, zeta = alpha zeta_QMD - (1 - alpha) B/A.
+    #
+    # ``mix_per_nucleon`` chooses whether that objective is *extensive* (False, the
+    # sum above — SACA's own N_f zeta_f) or *intensive* (True: the sum over
+    # fragments of zeta_f, i.e. each fragment divided by its A).  The intensive one
+    # is the "affinity" scale; weizsacker_qmd_energy's notes say it over-splits.
+    # ``e_cut_model="objective"`` tests zeta of whichever objective is in force.
+    #
+    #   "zeta_correct"       sum_f [zeta_f + lambda * bwd_f], the paper's ζ with the
+    #                        full QMD potential (qmd_full.full_cluster_energy:
+    #                        rest-frame kinetic + two- and three-body Skyrme +
+    #                        Yukawa + Coulomb + Pauli) plus lambda times the
+    #                        Weizsäcker energy bwd = -B_BWM, negative when bound.
+    #                        lambda is ``bwm_weight``.  Same sign as qmd_minus_b, on
+    #                        a different QMD energy.  ``spin_factor`` scales Pauli.
+    energy_model: str = "qmd"
+    bwm_weight: float = 1.0
+    mix_alpha: float = 1.0
+    mix_per_nucleon: bool = False
+    spin_factor: float = SPIN_FACTOR
+    yukawa: str = YUKAWA         # zeta_correct only: "folded" | "point"
 
 
 class _SacaEvent:
@@ -108,12 +188,24 @@ class _SacaEvent:
 
     def __init__(self, event: torch.Tensor, type_index: int = 7,
                  asymmetry: bool = False, e_0_asy: float = 23.3,
-                 gamma_asy: float = 1.0) -> None:
+                 gamma_asy: float = 1.0, energy_model: str = "qmd",
+                 bwm_weight: float = 1.0, mix_alpha: float = 1.0,
+                 mix_per_nucleon: bool = False,
+                 spin_factor: float = SPIN_FACTOR,
+                 yukawa: str = YUKAWA) -> None:
+        self.spin_factor = spin_factor
+        self.yukawa = yukawa
         self.x = event.cpu().numpy().astype(np.float64)
+        self._t = event.detach().cpu().float()   # physics.py wants float32 tensors
+        self.mix_alpha = mix_alpha
+        self.mix_per_nucleon = mix_per_nucleon
+        self._v_matrix: Optional[np.ndarray] = None
         self.n = event.shape[0]
         self.asymmetry = asymmetry
         self.e_0_asy = e_0_asy
         self.gamma_asy = gamma_asy
+        self.energy_model = energy_model
+        self.bwm_weight = bwm_weight
         self._cache: Dict[Tuple[int, ...], float] = {}
 
     def fragment_energy(self, idx: np.ndarray) -> float:
@@ -126,23 +218,151 @@ class _SacaEvent:
         key = tuple(sorted(int(i) for i in idx))
         hit = self._cache.get(key)
         if hit is None:
-            hit = cluster_energy(self.x[list(key)], asymmetry=self.asymmetry,
-                                 e_0_asy=self.e_0_asy,
-                                 gamma_asy=self.gamma_asy).total
+            if self.energy_model == "zeta_correct":
+                hit = full_cluster_energy(self.x[list(key)],
+                                          spin_factor=self.spin_factor,
+                                          yukawa=self.yukawa).total
+            else:
+                hit = cluster_energy(self.x[list(key)], asymmetry=self.asymmetry,
+                                     e_0_asy=self.e_0_asy,
+                                     gamma_asy=self.gamma_asy).total
             self._cache[key] = hit
         return hit
 
+    def fragment_terms(self, idx: np.ndarray) -> Tuple[float, float]:
+        """(T, V) of the fragment [MeV]: rest-frame kinetic and total potential.
+
+        The split of ``fragment_energy`` for whichever QMD energy the model uses:
+        ``zeta_correct`` -> qmd_full (Skyrme 2+3 body, Yukawa, Coulomb, Pauli);
+        the older models -> qmd_energy.cluster_energy (Skyrme, Coulomb, plus
+        Yukawa / asymmetry when on).  ``physics_v*`` have no such split and
+        return NaN.  A single nucleon is (0, 0).
+        """
+        if len(idx) < 2:
+            return 0.0, 0.0
+        if self.energy_model in ("physics_v", "physics_v_minus_b"):
+            return float("nan"), float("nan")
+        xs = self.x[sorted(int(i) for i in idx)]
+        if self.energy_model == "zeta_correct":
+            t = full_cluster_energy(xs, spin_factor=self.spin_factor, yukawa=self.yukawa)
+            return t.kinetic, t.potential
+        t = cluster_energy(xs, asymmetry=self.asymmetry, e_0_asy=self.e_0_asy,
+                           gamma_asy=self.gamma_asy)
+        return t.kinetic, t.total - t.kinetic
+
     def zeta(self, idx: np.ndarray) -> float:
-        """Binding energy per nucleon [MeV]; the quantity ``e_cut`` tests."""
+        """Binding energy per nucleon [MeV]; the quantity ``e_cut`` tests.
+
+        Always the plain QMD energy — the admissibility test is independent of
+        whatever the annealing happens to be minimizing.
+        """
         return self.fragment_energy(idx) / max(1, len(idx))
+
+    def physics_v(self, idx: np.ndarray) -> float:
+        """physics.py's pairwise QMD potential of the fragment [MeV]; 0 below two.
+
+        ``pairwise_potential_matrix`` is evaluated once for the whole event: each
+        entry is boosted to *its own pair's* rest frame, so it does not depend on
+        which fragment the two nucleons end up in and a fragment's V is a
+        submatrix sum.  (Unlike cluster_energy's Skyrme term, which is per
+        nucleon in the interaction density.)  Equal to ``total_potential_energy``
+        of the fragment — asserted in tests/test_saca_energy_models.py.
+        """
+        if len(idx) < 2:
+            return 0.0
+        if self._v_matrix is None:
+            t = self._t.unsqueeze(0)
+            mask = torch.ones(1, self.n, dtype=torch.bool)
+            self._v_matrix = pairwise_potential_matrix(t, mask)[0].double().numpy()
+        ii = np.asarray(idx, dtype=int)
+        return float(self._v_matrix[np.ix_(ii, ii)].sum() / 2.0)
+
+    def zeta_objective(self, idx: np.ndarray) -> float:
+        """Objective energy per nucleon — what ``e_cut_model="objective"`` tests."""
+        e = self.objective_energy(idx)
+        return e if self._intensive() else e / max(1, len(idx))
+
+    def _intensive(self) -> bool:
+        return self.energy_model == "mix" and self.mix_per_nucleon
+
+    def objective_energy(self, idx: np.ndarray) -> float:
+        """The quantity the annealing minimizes, per ``energy_model``."""
+        if self.energy_model in ("physics_v", "physics_v_minus_b", "mix"):
+            return self._objective_new(idx)
+        e = self.fragment_energy(idx)
+        if self.energy_model == "qmd":
+            return e
+        if self.energy_model not in ("qmd_plus_b", "qmd_minus_b", "zeta_correct"):
+            raise ValueError(f"unknown energy_model {self.energy_model!r}")
+        A = len(idx)
+        if A < 2:
+            return e
+        Z = int((self.x[idx, 7] == 1).sum())
+        if self.energy_model == "zeta_correct":
+            bwd = -bwm_binding(A, Z)          # Weizsäcker energy: negative when bound
+            return e + self.bwm_weight * bwd
+        b = self.bwm_weight * bwm_binding(A, Z)
+        return e + b if self.energy_model == "qmd_plus_b" else e - b
+
+    def _objective_new(self, idx: np.ndarray) -> float:
+        A = len(idx)
+        if A < 2:
+            return 0.0
+        Z = int((self.x[idx, 7] == 1).sum())
+        if self.energy_model == "physics_v":
+            return self.physics_v(idx)
+        if self.energy_model == "physics_v_minus_b":
+            return self.physics_v(idx) - self.bwm_weight * bwm_binding(A, Z)
+        a = self.mix_alpha
+        e = a * self.fragment_energy(idx) - (1.0 - a) * bwm_binding(A, Z)
+        return e / A if self.mix_per_nucleon else e
+
+
+_BWM_PER_A: Dict[Tuple[int, int], float] = {}
+
+
+def bwm_zeta(A: int, Z: int) -> float:
+    """-B_BWM(A, Z) / A [MeV/nucleon]: SACA 2.1's admissibility threshold.
+
+    Negative for a bound nuclide, so it drops straight into the same ``zeta <
+    cut`` comparison the constant -4 MeV/nucleon occupies in SACA 1.1.
+    """
+    key = (A, Z)
+    hit = _BWM_PER_A.get(key)
+    if hit is None:
+        b = float(bethe_weizsacker(torch.tensor([float(A)]),
+                                   torch.tensor([float(Z)])).item())
+        hit = -b / A
+        _BWM_PER_A[key] = hit
+    return hit
+
+
+def bwm_binding(A: int, Z: int) -> float:
+    """BWM binding energy B(A, Z) [MeV], positive for a bound nuclide."""
+    return -bwm_zeta(A, Z) * A
 
 
 def _is_bound(ev: "_SacaEvent", idx: np.ndarray, params: SacaParams) -> bool:
     """The SACA admissibility test, with its size-dependent threshold."""
     if len(idx) < 2:
         return False
-    cut = params.e_cut if len(idx) >= 3 else params.e_cut_light
-    return ev.zeta(idx) < cut
+    if len(idx) < 3:
+        # The three energy models added for baselines_comparison.py have no
+        # meaningful cluster_energy zeta of their own, so the N_f = 2 test is
+        # applied to their own objective; the older models keep the QMD zeta.
+        if params.energy_model in ("physics_v", "physics_v_minus_b", "mix",
+                                   "zeta_correct"):
+            return ev.zeta_objective(idx) < params.e_cut_light
+        return ev.zeta(idx) < params.e_cut_light
+    if params.e_cut_model == "objective":
+        return ev.zeta_objective(idx) < params.e_cut
+    if params.e_cut_model == "bwm":
+        A = len(idx)
+        Z = int((ev.x[idx, 7] == 1).sum())
+        return ev.zeta(idx) < params.bwm_scale * bwm_zeta(A, Z)
+    if params.e_cut_model != "constant":
+        raise ValueError(f"unknown e_cut_model {params.e_cut_model!r}")
+    return ev.zeta(idx) < params.e_cut
 
 
 def _clusters_from_labels(labels: np.ndarray) -> Dict[int, List[int]]:
@@ -176,7 +396,7 @@ def _anneal(
     Returns (best_clusters, n_proposed, n_accepted).
     """
     frozen = frozen or set()
-    energy = {c: ev.fragment_energy(np.asarray(m)) for c, m in clusters.items()}
+    energy = {c: ev.objective_energy(np.asarray(m)) for c, m in clusters.items()}
     total = sum(energy.values())
     best_total = total
     best = {c: list(m) for c, m in clusters.items() if m}
@@ -221,8 +441,8 @@ def _anneal(
                 dst = int(rng.choice(others))
                 new_src, new_dst = [], clusters[src] + clusters[dst]
 
-            e_new_src = ev.fragment_energy(np.asarray(new_src)) if new_src else 0.0
-            e_new_dst = ev.fragment_energy(np.asarray(new_dst))
+            e_new_src = ev.objective_energy(np.asarray(new_src)) if new_src else 0.0
+            e_new_dst = ev.objective_energy(np.asarray(new_dst))
             d = e_new_src + e_new_dst - energy[src] - (0.0 if to_new else energy[dst])
 
             if d < 0 or rng.random() < np.exp(-min(d / T, 700.0)):
@@ -240,7 +460,12 @@ def _anneal(
                 if total < best_total - 1e-9:
                     best_total = total
                     best = {c: list(m) for c, m in clusters.items() if m}
-        T *= params.alpha
+        if params.cooling == "geometric":
+            T *= params.alpha
+        elif params.cooling == "linear":
+            T -= (params.t_max - params.t_min) / params.n_steps
+        else:
+            raise ValueError(f"unknown cooling {params.cooling!r}")
     return best, n_prop, n_acc
 
 
@@ -252,6 +477,11 @@ class SacaResult:
     n_proposed: int = 0
     n_accepted: int = 0
     n_unstable_mst: int = 0     # MST fragments that failed the e_cut test
+    # Final-state sums over the fragments of N >= 2 (free nucleons contribute 0), MeV.
+    # For zeta_correct, e_final == t_sum + v_sum + bwm_weight * bwd_sum.
+    t_sum: float = float("nan")     # rest-frame kinetic energy, summed
+    v_sum: float = float("nan")     # QMD potential, summed
+    bwd_sum: float = float("nan")   # Weizsaecker energy -B_BWM, summed (unweighted)
 
 
 def saca_clusters(
@@ -268,13 +498,17 @@ def saca_clusters(
     """Run the full MST -> classify -> anneal -> recombine pipeline on one event."""
     rng = rng or np.random.default_rng()
     ev = _SacaEvent(event, type_index, asymmetry=params.asymmetry,
-                    e_0_asy=params.e_0_asy, gamma_asy=params.gamma_asy)
+                    e_0_asy=params.e_0_asy, gamma_asy=params.gamma_asy,
+                    energy_model=params.energy_model,
+                    bwm_weight=params.bwm_weight, mix_alpha=params.mix_alpha,
+                    mix_per_nucleon=params.mix_per_nucleon,
+                    spin_factor=params.spin_factor, yukawa=params.yukawa)
 
     x = event.unsqueeze(0)
     mask = torch.ones(1, event.shape[0], dtype=torch.bool, device=event.device)
     mst = mst_clusters(x, mask, d_cut, p_cut, metric, p_frame)[0].cpu().numpy()
     clusters = _clusters_from_labels(mst)
-    e_initial = sum(ev.fragment_energy(np.asarray(m)) for m in clusters.values())
+    e_initial = sum(ev.objective_energy(np.asarray(m)) for m in clusters.values())
 
     # Step 2 — stable / unstable by binding energy per nucleon.
     stable, unstable = {}, {}
@@ -316,9 +550,19 @@ def saca_clusters(
     for new_c, (_, members) in enumerate(sorted(final.items())):
         for i in members:
             labels[i] = new_c
-    e_final = sum(ev.fragment_energy(np.asarray(m)) for m in final.values())
+    e_final = sum(ev.objective_energy(np.asarray(m)) for m in final.values())
+    t_sum = v_sum = bwd_sum = 0.0
+    for m in final.values():
+        if len(m) < 2:
+            continue
+        idx = np.asarray(m)
+        t, v = ev.fragment_terms(idx)
+        t_sum += t
+        v_sum += v
+        bwd_sum += -bwm_binding(len(idx), int((ev.x[idx, 7] == 1).sum()))
     return SacaResult(labels=labels, e_initial=e_initial, e_final=e_final,
-                      n_proposed=n_prop, n_accepted=n_acc, n_unstable_mst=n_unstable)
+                      n_proposed=n_prop, n_accepted=n_acc, n_unstable_mst=n_unstable,
+                      t_sum=t_sum, v_sum=v_sum, bwd_sum=bwd_sum)
 
 
 class SACABaseline:

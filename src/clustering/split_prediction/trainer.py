@@ -14,6 +14,8 @@ from clustering.physics import (
     total_potential_energy,
     fragment_energy,
     weizsacker_qmd_energy,
+    qmd_minus_b_energy,
+    saca_qmd_minus_b_energy,
 )
 from clustering.split_prediction.model import SplitPredictionModel
 
@@ -487,6 +489,8 @@ class KSplitTrainer:
         reward_type: str = "qmd_asym",
         qmd_weight: float = 1.0,
         energy_scale: str = "extensive",
+        bwm_weight: float = 1.0,
+        bwm_form: str = "bwm",
     ) -> None:
         self.model = model.to(device)
         self.critic = critic.to(device) if critic is not None else None
@@ -524,6 +528,14 @@ class KSplitTrainer:
         #   "qmd_asym"       U = QMD potential + asymmetry penalty      (the main-branch reward)
         #   "weizsacker_qmd" U = qmd_weight·V − W  (maximize Weizsäcker W, minimize QMD V),
         #                    with energy_scale = "extensive" | "per_nucleon" (see weizsacker_qmd_energy)
+        #   "qmd_minus_b"    U = V − bwm_weight·B  — the SACA annealer's QMD − B
+        #                    objective, with bwm_form = "bwm" | "bw" selecting the
+        #                    mass formula (see qmd_minus_b_energy).  The weight sits
+        #                    on B here, not on V, to match the baseline's λ scan.
+        #   "saca_qmd_minus_b"  the same objective on the *baselines'* QMD energy
+        #                    (qmd_energy.cluster_energy: saturating Skyrme, plus the
+        #                    rest-frame kinetic term) rather than on physics.py's
+        #                    non-saturating potential.  See saca_qmd_minus_b_energy.
         if reward_type == "qmd_asym":
             self.energy_fn = fragment_energy
         elif reward_type == "weizsacker_qmd":
@@ -534,12 +546,23 @@ class KSplitTrainer:
             self.energy_fn = partial(
                 weizsacker_qmd_energy, qmd_weight=qmd_weight, scale=energy_scale
             )
+        elif reward_type in ("qmd_minus_b", "saca_qmd_minus_b"):
+            if bwm_form not in ("bwm", "bw"):
+                raise ValueError(
+                    f"unknown bwm_form {bwm_form!r}; expected 'bwm' or 'bw'"
+                )
+            fn = (qmd_minus_b_energy if reward_type == "qmd_minus_b"
+                  else saca_qmd_minus_b_energy)
+            self.energy_fn = partial(fn, bwm_weight=bwm_weight, binding=bwm_form)
         else:
             raise ValueError(
-                f"unknown reward_type {reward_type!r}; expected 'qmd_asym' or 'weizsacker_qmd'"
+                f"unknown reward_type {reward_type!r}; expected 'qmd_asym', "
+                f"'weizsacker_qmd', 'qmd_minus_b' or 'saca_qmd_minus_b'"
             )
         self.reward_type = reward_type
         self.energy_scale = energy_scale
+        self.bwm_weight = bwm_weight
+        self.bwm_form = bwm_form
 
     def _step(
         self, x: torch.Tensor, mask: torch.Tensor
