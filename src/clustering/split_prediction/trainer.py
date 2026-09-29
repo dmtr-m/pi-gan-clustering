@@ -261,6 +261,39 @@ def compute_k_level_reward(
     return (U_parent - U_leaves) / n_parent
 
 
+def compute_final_sum_reward(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    leaf_masks: Dict[Tuple, torch.Tensor],
+    type_index: int = 7,
+    min_fragment_size: int = 2,
+    energy_fn=fragment_energy,
+) -> torch.Tensor:
+    """Terminal reward on the final partition.  Returns (B,) tensor.
+
+    ```
+    R = − Σ_leaves U(leaf) / N_parent
+    ```
+
+    The *sum of the fragments' energies*, not the drop from the parent's.  The
+    sign is minus so that maximizing R minimizes the SACA objective.  Leaves below
+    ``min_fragment_size`` (singletons) contribute 0, the same convention as
+    ``compute_k_level_reward``.  ``U(parent)`` is a constant per event, so within
+    one event this ranks partitions exactly as ``compute_k_level_reward`` does; the
+    difference is the *credit*: one return per event, shared by every split in its
+    tree, and the do-nothing partition scores ``−U(parent)/N`` instead of being
+    unscorable.  Divided by ``N_parent`` for the same MeV/nucleon scale as before.
+    """
+    B = x.shape[0]
+    U_leaves = x.new_zeros(B)
+    for lm in leaf_masks.values():
+        big = lm.sum(dim=1) >= min_fragment_size
+        if big.any():
+            U_leaves[big] = U_leaves[big] + energy_fn(x[big], lm[big], type_index)
+    n_parent = mask.sum(dim=1).float().clamp(min=1)
+    return -U_leaves / n_parent
+
+
 # ─── Reward ──────────────────────────────────────────────────────────────────
 
 def fragments_affinity(x: torch.Tensor, mask: torch.Tensor, type_index: int = 7) -> torch.Tensor:
@@ -494,6 +527,7 @@ class KSplitTrainer:
         bwm_form: str = "bwm",
         zeta_spin_factor: float = 0.5,
         zeta_yukawa: str = "folded",
+        reward_mode: str = "node_diff",
     ) -> None:
         self.model = model.to(device)
         self.critic = critic.to(device) if critic is not None else None
@@ -575,6 +609,18 @@ class KSplitTrainer:
                 f"unknown reward_type {reward_type!r}; expected 'qmd_asym', "
                 f"'weizsacker_qmd', 'qmd_minus_b', 'saca_qmd_minus_b' or 'zeta_correct'"
             )
+        # How the energy becomes a reward.
+        #   "node_diff"  per split node, q = (U(node) − Σ U(child)) / N_node — a
+        #                contextual bandit per split (the historical behaviour).
+        #   "final_sum"  one terminal return per event, R = −Σ_leaves U(leaf) / N,
+        #                shared by every split decision in that event's tree
+        #                (compute_final_sum_reward).  Needs the whole tree's graph
+        #                in memory until the return is known.
+        if reward_mode not in ("node_diff", "final_sum"):
+            raise ValueError(
+                f"unknown reward_mode {reward_mode!r}; expected 'node_diff' or 'final_sum'"
+            )
+        self.reward_mode = reward_mode
         self.reward_type = reward_type
         self.energy_scale = energy_scale
         self.bwm_weight = bwm_weight
@@ -590,6 +636,8 @@ class KSplitTrainer:
         Gradients are accumulated across nodes and applied with a single
         ``optim.step()`` per batch.
         """
+        if self.reward_mode == "final_sum":
+            return self._step_final(x, mask)
         self.model.train()
         if self.critic is not None:
             self.critic.train()
@@ -681,6 +729,7 @@ class KSplitTrainer:
             "wn_sum": wn_sum,
             "depth_sum": depth_sum,
             "ent_sum": ent_sum,
+            "ent_n": wn_sum,
             "n_valid_items": float(n_valid_items),
             "n_seen_items": float(n_seen_items),
         }
@@ -705,13 +754,94 @@ class KSplitTrainer:
             stats,
         )
 
+    def _step_final(
+        self, x: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[float, "torch.Tensor | None", float, float, Dict[str, float]]:
+        """Actor-Critic / REINFORCE update on the terminal return ``R = −ΣU(leaf)/N``.
+
+        One tree is sampled per event, its final partition scored once, and that
+        return credited to every split decision in the tree: the loss is
+        ``−A · Σ_nodes log π`` with ``A = R_norm − V(root)``.  Every event counts,
+        including one the policy left unsplit (``R = −U(parent)/N``): there is no
+        ``valid`` mask, so collapsing to "do not split" is scored rather than
+        hidden.  The whole tree's autograd graph is held until the return is known
+        (no per-node backward), so memory grows with depth — watch it at large k.
+        """
+        self.model.train()
+        if self.critic is not None:
+            self.critic.train()
+        self.optim.zero_grad()
+
+        out = k_level_forward(self.model, x, mask, self.k, self.min_fragment_size)
+        leaf_masks = out["leaf_masks"]
+        stats = {"n_nodes": 0.0, "wq_sum": 0.0, "wn_sum": 0.0, "depth_sum": 0.0,
+                 "ent_sum": 0.0, "ent_n": 0.0, "n_valid_items": 0.0, "n_seen_items": 0.0}
+        B = x.shape[0]
+        if not leaf_masks:
+            return 0.0, None, 0.0, 0.0, stats
+
+        with torch.no_grad():
+            R = compute_final_sum_reward(
+                x, mask, leaf_masks, self.type_index, self.min_fragment_size,
+                energy_fn=self.energy_fn,
+            ).detach()                                       # (B,)
+        log_probs = out["path_log_probs"].sum(dim=1)         # (B,) in graph
+
+        if not self._norm_init and R.numel() > 1:
+            self.baseline = float(R.mean().item())
+            self.return_std = max(float(R.std().item()), 1e-6)
+            self._norm_init = True
+        R_norm = (R - self.baseline) / (self.return_std + 1e-6)
+
+        if self.critic is not None:
+            n = mask.sum(dim=1).float().clamp(min=1)
+            with torch.no_grad():
+                u_root = self.energy_fn(x, mask, self.type_index)
+                z = ((x[..., self.type_index] == 1) & mask).sum(dim=1).float()
+            root = dict(n=n, zfrac=z / n, u_per_n=u_root / n, depth=0)
+            V = self.critic(x, mask, node_scalars(root, self.k))          # (B,)
+            advantage = (R_norm - V).detach()
+            value_loss = ((V - R_norm) ** 2).mean()
+            loss = -(advantage * log_probs).mean() + self.value_coef * value_loss
+            value_loss_f = float(value_loss.item())
+        else:
+            advantage = (R_norm - R_norm.mean() if R_norm.numel() > 1 else R_norm).detach()
+            loss = -(advantage * log_probs).mean()
+            value_loss_f = 0.0
+        loss.backward()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        if self.critic is not None:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
+        self.optim.step()
+
+        # Diagnostics, kept on the same keys as node mode.  q_weighted here is the
+        # size-weighted mean terminal return.  node_depth is the mean number of
+        # splits on a nucleon's path (a leaf's path length is its split count);
+        # ent_n counts split *decisions* (nucleon x level), so `entropy` stays a
+        # per-decision figure comparable with node mode.
+        n_p = mask.sum(dim=1).float()
+        decisions = torch.zeros(B, device=x.device)
+        for path, lm in leaf_masks.items():
+            decisions = decisions + len(path) * lm.sum(dim=1).float()
+        stats.update(
+            n_nodes=float(B),
+            wq_sum=float((R * n_p).sum().item()),
+            wn_sum=float(n_p.sum().item()),
+            depth_sum=float((decisions / n_p.clamp(min=1)).sum().item()),
+            ent_sum=float(-log_probs.detach().sum().item()),
+            ent_n=float(decisions.sum().item()),
+            n_valid_items=float(B),
+            n_seen_items=float(B),
+        )
+        return float(loss.item()), R, value_loss_f, float(grad_norm), stats
     def train_epoch(self) -> Tuple[float, float, float, float, Dict[str, float]]:
         total_loss = 0.0
         total_value_loss = 0.0
         total_grad_norm = 0.0
         all_rewards: List[float] = []
         agg = {"n_nodes": 0.0, "wq_sum": 0.0, "wn_sum": 0.0, "depth_sum": 0.0,
-               "ent_sum": 0.0, "n_valid_items": 0.0, "n_seen_items": 0.0}
+               "ent_sum": 0.0, "ent_n": 0.0, "n_valid_items": 0.0, "n_seen_items": 0.0}
         n = 0
         for batch in self.dataloader:
             loss, rewards, value_loss, grad_norm, stats = self._step(
@@ -748,7 +878,7 @@ class KSplitTrainer:
             sh["valid_frac"].append(
                 stats["n_valid_items"] / stats["n_seen_items"]
                 if stats["n_seen_items"] else float("nan"))
-            _h = stats["ent_sum"] / stats["wn_sum"] if stats["wn_sum"] else float("nan")
+            _h = stats["ent_sum"] / stats["ent_n"] if stats["ent_n"] else float("nan")
             sh["entropy"].append(_h)
             sh["entropy_frac"].append(_h / self._log_k)
 
@@ -778,9 +908,9 @@ class KSplitTrainer:
                            if agg["n_valid_items"] else 0.0),
             "valid_frac": (agg["n_valid_items"] / agg["n_seen_items"]
                            if agg["n_seen_items"] else 0.0),
-            "entropy": agg["ent_sum"] / agg["wn_sum"] if agg["wn_sum"] else 0.0,
-            "entropy_frac": ((agg["ent_sum"] / agg["wn_sum"]) / self._log_k
-                             if agg["wn_sum"] else 0.0),
+            "entropy": agg["ent_sum"] / agg["ent_n"] if agg["ent_n"] else 0.0,
+            "entropy_frac": ((agg["ent_sum"] / agg["ent_n"]) / self._log_k
+                             if agg["ent_n"] else 0.0),
         }
         return total_loss / n, avg_reward, total_value_loss / n, total_grad_norm / n, diag
 
@@ -799,6 +929,16 @@ class KSplitTrainer:
             x = batch["x"].to(self.device)
             mask = batch["mask"].to(self.device)
             result = k_level_forward(self.model, x, mask, self.k, self.min_fragment_size)
+            if self.reward_mode == "final_sum":
+                # Every event counts, unsplit ones included — see _step_final.
+                if not result["leaf_masks"]:
+                    continue
+                r = compute_final_sum_reward(
+                    x, mask, result["leaf_masks"], self.type_index,
+                    self.min_fragment_size, energy_fn=self.energy_fn,
+                )
+                rewards.extend(r.cpu().tolist())
+                continue
             valid = result["valid"]
             if not valid.any():
                 continue

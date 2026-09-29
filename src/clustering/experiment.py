@@ -243,6 +243,13 @@ class ClusteringConfig:
     # same-isospin pairs same-spin, 0.5 = random-spin average); zeta_yukawa is
     # "folded" | "point" | "off".  See baselines/qmd_full.py and FORMULAS.md 5a.
     zeta_spin_factor: float = 0.5
+    # How the energy becomes a reward.  "node_diff" (historical): per split node,
+    # q = (U(node) − ΣU(child))/N.  "final_sum": one terminal return per event,
+    # R = −Σ_leaves U(leaf)/N, shared by every split in its tree (unsplit events
+    # are scored, not masked).  Ranks partitions identically within an event; what
+    # changes is the credit assignment.  eval_reward is on a different scale from
+    # node_diff runs — do not compare them.
+    reward_mode: str = "node_diff"
     zeta_yukawa: str = "folded"
 
     # Actor-Critic: DeepSets V(s) replaces the scalar EMA baseline.
@@ -505,6 +512,7 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         bwm_form=cfg.bwm_form,
         zeta_spin_factor=cfg.zeta_spin_factor,
         zeta_yukawa=cfg.zeta_yukawa,
+        reward_mode=cfg.reward_mode,
     )
     history = trainer.train(n_epochs=cfg.split_epochs)
     torch.save(model.state_dict(), exp.dm_model_path)
@@ -1319,6 +1327,7 @@ def main(cfg: DictConfig) -> None:
     aim_run.add_tag(f"particle:{cfg.particle_type}")
     aim_run.add_tag(f"critic:{'on' if cfg.use_critic else 'off'}")
     aim_run.add_tag(f"reward:{cfg.reward_type}")
+    aim_run.add_tag(f"mode:{cfg.reward_mode}")
     if cfg.reward_type == "weizsacker_qmd":
         aim_run.add_tag(f"scale:{cfg.energy_scale}")
     if cfg.reward_type in ("qmd_minus_b", "saca_qmd_minus_b"):

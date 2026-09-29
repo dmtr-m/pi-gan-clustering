@@ -45,7 +45,7 @@ from clustering.split_prediction.dataset import NucleonDataset
 from clustering.split_prediction.mst import mst_clusters
 
 LAMBDAS = [0.0, 0.25, 0.5, 1.0, 1.5]
-ZETA_LAMBDAS = [0.0, 0.5, 1.0, 1.5, 2.0, 4.0]   # zeta_correct needed lambda >~ 1.5 in SACA
+ZETA_LAMBDAS = [-4.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]   # zeta_correct needed lambda >~ 1.5 in SACA
 N_RANDOM = 6
 
 
@@ -125,9 +125,13 @@ def main() -> None:
             "no-split": [mask],
             "MST d=2.0": leaf_masks_from_labels(
                 mst_clusters(x, mask, d_cut=2.0, metric="coord"), mask),
+            "MST d=1.5": leaf_masks_from_labels(
+                mst_clusters(x, mask, d_cut=1.5, metric="coord"), mask),
             "MSTp d=3.0/p=150": leaf_masks_from_labels(
                 mst_clusters(x, mask, d_cut=3.0, p_cut=150.0, metric="mstp"), mask),
         }
+        # every nucleon alone: the far end of the fragmentation axis
+        parts["singletons"] = [mask & (torch.arange(N)[None, :] == j) for j in range(N)]
         rnd = torch.randint(0, N_RANDOM, (len(chunk), N))
         parts[f"random {N_RANDOM}-way"] = [(rnd == c) & mask for c in range(N_RANDOM)]
 
