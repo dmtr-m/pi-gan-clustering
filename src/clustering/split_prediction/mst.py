@@ -30,6 +30,7 @@ import torch.optim as optim
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from clustering.physics import MOMENTUM_TO_MEV, _pairwise_lorentz_boost
 from clustering.split_prediction.model import SplitPredictionModel
@@ -304,6 +305,15 @@ class MSTPretrainer:
 
     def train(self, n_epochs: int, verbose: bool = True, log_every: int = 1) -> Dict[str, List[float]]:
         history: Dict[str, List[float]] = {"loss": [], "pair_acc": []}
+        steps_per_epoch = len(self.dataloader)
+        total_steps = steps_per_epoch * n_epochs
+        pbar = None
+        if verbose:
+            print(f"[MST] {total_steps} optimizer steps = {n_epochs} epochs x "
+                  f"{steps_per_epoch} steps/epoch "
+                  f"(batch_size={getattr(self.dataloader, 'batch_size', '?')})")
+            pbar = tqdm(total=total_steps, desc="MST warm-start", unit="step",
+                        mininterval=1.0, dynamic_ncols=True)
         for ep in range(1, n_epochs + 1):
             losses, accs = [], []
             for batch in self.dataloader:
@@ -319,16 +329,21 @@ class MSTPretrainer:
                 sh["pair_acc"].append(a)
                 sh["grad_norm"].append(g)
                 sh["entropy_frac"].append(h)
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(ep=ep, loss=f"{l:.3f}", acc=f"{a:.3f}", refresh=False)
             self.epoch_end_steps.append(self.global_step)
             # nanmean: skip batches that had no valid pair at all.
             history["loss"].append(float(np.nanmean(losses)))
             history["pair_acc"].append(float(np.nanmean(accs)))
             if verbose and ep % log_every == 0:
-                print(
+                tqdm.write(
                     f"[MST] {ep:4d}/{n_epochs}  "
                     f"loss={history['loss'][-1]:.4f}  "
                     f"pair_acc={history['pair_acc'][-1]:.3f}"
                 )
+        if pbar is not None:
+            pbar.close()
         return history
 
 

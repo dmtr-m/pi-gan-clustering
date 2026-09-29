@@ -5,6 +5,7 @@ import numpy as np
 
 from typing import Dict, List, Tuple
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from functools import partial
 
@@ -881,6 +882,13 @@ class KSplitTrainer:
             _h = stats["ent_sum"] / stats["ent_n"] if stats["ent_n"] else float("nan")
             sh["entropy"].append(_h)
             sh["entropy_frac"].append(_h / self._log_k)
+            pbar = getattr(self, "_pbar", None)
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(
+                    ep=len(self.epoch_end_steps) + 1,
+                    R=(f"{float(rewards.mean().item()):.2f}" if rewards is not None else "nan"),
+                    grad=f"{grad_norm:.1f}", refresh=False)
 
         # One EMA update per epoch: baseline tracks epoch-mean reward,
         # so the plotted curve is as smooth as the epoch-average reward.
@@ -959,6 +967,18 @@ class KSplitTrainer:
             "q_weighted": [], "n_nodes": [], "node_depth": [], "valid_frac": [],
             "entropy": [], "entropy_frac": [],
         }
+        # Announce the step budget up front and track it with a bar: one tick per
+        # optimizer step (epoch-level lines are too coarse to see a run's pace).
+        steps_per_epoch = len(self.dataloader)
+        total_steps = steps_per_epoch * n_epochs
+        self._pbar = None
+        if verbose:
+            print(f"[KS] {total_steps} optimizer steps = {n_epochs} epochs x "
+                  f"{steps_per_epoch} steps/epoch "
+                  f"(batch_size={getattr(self.dataloader, 'batch_size', '?')}, "
+                  f"reward_type={self.reward_type}, reward_mode={self.reward_mode})")
+            self._pbar = tqdm(total=total_steps, desc="REINFORCE", unit="step",
+                              mininterval=1.0, dynamic_ncols=True)
         for ep in range(1, n_epochs + 1):
             lr = self.optim.param_groups[0]["lr"]  # LR used for this epoch
             avg_loss, avg_reward, avg_value_loss, avg_grad_norm, diag = self.train_epoch()
@@ -978,7 +998,7 @@ class KSplitTrainer:
                 history[key].append(diag[key])
             if verbose and ep % log_every == 0:
                 critic_msg = f"  v_loss={avg_value_loss:.3f}" if self.critic is not None else ""
-                print(
+                tqdm.write(
                     f"[KS] {ep:4d}/{n_epochs}  "
                     f"loss={avg_loss:.4f}  "
                     f"reward={avg_reward:.4f}  "
@@ -993,4 +1013,7 @@ class KSplitTrainer:
                     f"  lr={lr:.2e}"
                     f"{critic_msg}"
                 )
+        if self._pbar is not None:
+            self._pbar.close()
+            self._pbar = None
         return history
