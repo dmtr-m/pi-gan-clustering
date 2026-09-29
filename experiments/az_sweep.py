@@ -2,7 +2,7 @@
 
     PYTHONUNBUFFERED=1 PYTHONPATH=src .venv/bin/python experiments/az_sweep.py --n-events 5000
 
-Rows are depths k = 1, 2, 4, 8 and columns are seeds 0, 1, 2 (the greedy/argmax policy).  The
+Rows are depths k = 1, 2, 4, 8 (--sweep depth) or bwm_weight = 0, 0.25, 0.5, 1 (--sweep lambda) and columns are seeds 0, 1, 2 (the greedy/argmax policy).  The
 top row is Target, MST d=2.0 and MSTp d=3.0,p=150.  Every model scores the same batches, so the
 panels are paired.  Same renderer, target and stat box as baseline_grid.py / az_policy.py; both
 spectator sides are used so yields are per collision, and the policy (trained on
@@ -29,12 +29,19 @@ from clustering.split_prediction.mst import mst_clusters  # noqa: E402
 from clustering.split_prediction.progress import StepProgress  # noqa: E402
 from clustering.split_prediction.trainer import k_level_forward  # noqa: E402
 
-RUNS = {(1, 0): "outputs/sweep_depth/k1_s0", (1, 1): "outputs/sweep_depth/k1_s1",
+RUNS_DEPTH = {(1, 0): "outputs/sweep_depth/k1_s0", (1, 1): "outputs/sweep_depth/k1_s1",
         (1, 2): "outputs/sweep_depth/k1_s2", (2, 0): "outputs/sweep_depth/k2_s0",
         (2, 1): "outputs/sweep_depth/k2_s1", (2, 2): "outputs/sweep_depth/k2_s2",
         (4, 0): "outputs/sweep_depth/k4_s0", (4, 1): "outputs/sweep_depth/k4_s1",
         (4, 2): "outputs/sweep_depth/k4_s2", (8, 0): "outputs/2026-09-29/17-11-42",
         (8, 1): "outputs/2026-09-29/17-40-17", (8, 2): "outputs/sweep_depth/k8_s2"}
+# lambda sweep (k=4): rows are bwm_weight; lambda=0.5 is the k=4 row of the depth sweep.
+RUNS_LAMBDA = {(0.0, s): f"outputs/sweep_lambda/l0_s{s}" for s in range(3)}
+RUNS_LAMBDA.update({(0.25, s): f"outputs/sweep_lambda/l0.25_s{s}" for s in range(3)})
+RUNS_LAMBDA.update({(0.5, s): f"outputs/sweep_depth/k4_s{s}" for s in range(3)})
+RUNS_LAMBDA.update({(1.0, s): f"outputs/sweep_lambda/l1.0_s{s}" for s in range(3)})
+SWEEPS = {"depth": (RUNS_DEPTH, "k", "Depth sweep", "figures/az_sweep_depth.png"),
+          "lambda": (RUNS_LAMBDA, "λ", "Weizsäcker-weight sweep (k=4)", "figures/az_sweep_lambda.png")}
 A_MAX, Z_MAX = 132, 60
 
 
@@ -43,8 +50,11 @@ def main() -> None:
     ap.add_argument("--n-events", type=int, default=5000, help="events per spectator side")
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--data", default="data/xecs_hse.parquet")
-    ap.add_argument("--out", default="figures/az_sweep_depth.png")
+    ap.add_argument("--sweep", choices=list(SWEEPS), default="depth")
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    RUNS, row_name, title, default_out = SWEEPS[args.sweep]
+    out_path = args.out or default_out
 
     models = {}
     for key, d in RUNS.items():
@@ -54,7 +64,10 @@ def main() -> None:
         m.load_state_dict(torch.load(f"{d}/dm_model.pt", map_location="cpu"))
         m.eval()
         models[key] = (m, cfg["split_k"])
-        assert cfg["split_k"] == key[0], f"{d}: split_k {cfg['split_k']} != {key[0]}"
+        if args.sweep == "depth":
+            assert cfg["split_k"] == key[0], f"{d}: split_k {cfg['split_k']} != {key[0]}"
+        else:
+            assert abs(cfg["bwm_weight"] - key[0]) < 1e-9, f"{d}: bwm_weight != {key[0]}"
 
     loaders = [DataLoader(NucleonDataset(args.data, particle_type=side, n_events=args.n_events),
                           batch_size=args.batch, shuffle=False, collate_fn=collate_fn)
@@ -89,15 +102,15 @@ def main() -> None:
 
     ref = load_target()
     g = np.array([ref[(ref[:, 0] >= lo) & (ref[:, 0] <= hi), 2].sum() for lo, hi in BINS])
-    depths = sorted({k for k, _ in models})
+    depths = sorted({k for k, _ in models})   # the row values (depths or lambdas)
     panels = [(0, 1, "MST d=2.0", mst2), (0, 2, "MSTp d=3.0, p=150", mstp)]
     for i, k in enumerate(depths):
         for s in range(3):
-            panels.append((i + 1, s, f"k={k}, seed {s}", counters[(k, s)]))
-    render_grid(panels, ref, n_coll, g, args.out,
-                f"Depth sweep — fragment (A, Z) yield per collision, {n_coll:.0f} collisions",
+            panels.append((i + 1, s, f"{row_name}={k:g}, seed {s}", counters[(k, s)]))
+    render_grid(panels, ref, n_coll, g, out_path,
+                f"{title} — fragment (A, Z) yield per collision, {n_coll:.0f} collisions",
                 n_rows=1 + len(depths), n_cols=3, a_max=A_MAX, z_max=Z_MAX,
-                row_labels={i + 1: f"k={k}" for i, k in enumerate(depths)}, panel_in=4.2)
+                row_labels={i + 1: f"{row_name}={k:g}" for i, k in enumerate(depths)}, panel_in=4.2)
     print_table(panels, ref, n_coll, g)
     print_bands(panels, ref)
 
