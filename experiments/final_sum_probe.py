@@ -49,6 +49,8 @@ def main() -> None:
     ap.add_argument("--n-events", type=int, default=100)
     ap.add_argument("--data", default="data/xecs_hse.parquet")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--zeta-spin", type=float, default=0.5)
+    ap.add_argument("--zeta-yukawa", default="folded")
     args = ap.parse_args()
 
     ds = NucleonDataset(args.data, particle_type="SpectatorsLeft")
@@ -60,8 +62,10 @@ def main() -> None:
         "saca_qmd_minus_b  l=0": partial(saca_qmd_minus_b_energy, bwm_weight=0.0),
         "saca_qmd_minus_b  l=0.5": partial(saca_qmd_minus_b_energy, bwm_weight=0.5),
         "saca_qmd_minus_b  l=1": partial(saca_qmd_minus_b_energy, bwm_weight=1.0),
-        "zeta_correct      l=0": partial(zeta_correct_energy, bwm_weight=0.0),
-        "zeta_correct      l=1": partial(zeta_correct_energy, bwm_weight=1.0),
+        f"zeta_correct s={args.zeta_spin:g} l=0": partial(
+            zeta_correct_energy, bwm_weight=0.0, spin_factor=args.zeta_spin, yukawa=args.zeta_yukawa),
+        f"zeta_correct s={args.zeta_spin:g} l=1": partial(
+            zeta_correct_energy, bwm_weight=1.0, spin_factor=args.zeta_spin, yukawa=args.zeta_yukawa),
     }
     R: Dict[str, Dict[str, List[torch.Tensor]]] = {e: {} for e in energies}
     frags: Dict[str, List[torch.Tensor]] = {}
