@@ -39,11 +39,13 @@ from clustering.physics import (
     saca_qmd_minus_b_energy,
     total_potential_energy,
     weizsacker_formula,
+    zeta_correct_energy,
 )
 from clustering.split_prediction.dataset import NucleonDataset
 from clustering.split_prediction.mst import mst_clusters
 
 LAMBDAS = [0.0, 0.25, 0.5, 1.0, 1.5]
+ZETA_LAMBDAS = [0.0, 0.5, 1.0, 1.5, 2.0, 4.0]   # zeta_correct needed lambda >~ 1.5 in SACA
 N_RANDOM = 6
 
 
@@ -68,12 +70,13 @@ def leaf_masks_from_labels(labels: torch.Tensor, mask: torch.Tensor) -> List[tor
 
 
 def score(x: torch.Tensor, mask: torch.Tensor,
-          leaves: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
+          leaves: List[torch.Tensor], zeta_kw: Dict) -> Dict[str, torch.Tensor]:
     """V_cut, dB (both mass formulas) and the fragment count, per event."""
     A_p = mask.sum(dim=1).float()
     Z_p = ((x[..., 7] == 1) & mask).sum(dim=1).float()
     V_cut = total_potential_energy(x, mask)
     E_cut = saca_qmd_minus_b_energy(x, mask, bwm_weight=0.0)
+    Z_cut = zeta_correct_energy(x, mask, bwm_weight=0.0, **zeta_kw)
     dB = {f: -binding(A_p, Z_p, f) for f in ("bwm", "bw")}
     n_frag = torch.zeros_like(A_p)
 
@@ -82,11 +85,12 @@ def score(x: torch.Tensor, mask: torch.Tensor,
         Z = ((x[..., 7] == 1) & lm).sum(dim=1).float()
         V_cut = V_cut - total_potential_energy(x, lm)
         E_cut = E_cut - saca_qmd_minus_b_energy(x, lm, bwm_weight=0.0)
+        Z_cut = Z_cut - zeta_correct_energy(x, lm, bwm_weight=0.0, **zeta_kw)
         for f in dB:
             dB[f] = dB[f] + binding(A, Z, f)
         n_frag = n_frag + (A >= 2).float()
 
-    return dict(V_cut=V_cut, E_cut=E_cut, dB_bwm=dB["bwm"], dB_bw=dB["bw"],
+    return dict(V_cut=V_cut, E_cut=E_cut, Z_cut=Z_cut, dB_bwm=dB["bwm"], dB_bw=dB["bw"],
                 n_frag=n_frag, n_parent=A_p)
 
 
@@ -95,6 +99,8 @@ def main() -> None:
     ap.add_argument("--n-events", type=int, default=200)
     ap.add_argument("--data", default="data/xecs_hse.parquet")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--zeta-spin", type=float, default=0.5)
+    ap.add_argument("--zeta-yukawa", default="folded")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -103,6 +109,7 @@ def main() -> None:
     events = [ds[i] for i in range(n)]
     events = [e[0] if isinstance(e, (tuple, list)) else e for e in events]
 
+    zeta_kw = dict(spin_factor=args.zeta_spin, yukawa=args.zeta_yukawa)
     acc: Dict[str, List[Dict[str, torch.Tensor]]] = {}
     batch = 16
     for lo in range(0, n, batch):
@@ -125,7 +132,7 @@ def main() -> None:
         parts[f"random {N_RANDOM}-way"] = [(rnd == c) & mask for c in range(N_RANDOM)]
 
         for name, leaves in parts.items():
-            acc.setdefault(name, []).append(score(x, mask, leaves))
+            acc.setdefault(name, []).append(score(x, mask, leaves, zeta_kw))
 
     print(f"{n} events, {args.data}\n")
     hdr = (f"{'partition':<20}{'frags':>7}{'V_cut':>10}"
@@ -162,6 +169,17 @@ def main() -> None:
                 f"{agg['dB_bwm'].mean():9.1f}{agg['dB_bw'].mean():9.1f}")
         line += "".join(f"{(agg['E_cut'] + l * agg['dB_bwm']).mean():12.1f}"
                         for l in LAMBDAS)
+        print(line)
+
+    # zeta_correct: the reward reward_type="zeta_correct" pays.  Its lambda multiplies
+    # bwd = -B_BWM, so q*N = Z_cut + lambda * dB_bwm, same algebra as above.
+    print(f"\nzeta_correct (spin={args.zeta_spin:g}, yukawa={args.zeta_yukawa}), BWM binding")
+    print(hdr.replace("V_cut", "Z_cut") + "".join(f"{'q*N l=' + f'{l:g}':>12}" for l in ZETA_LAMBDAS))
+    for name, agg in rows.items():
+        line = (f"{name:<20}{agg['n_frag'].mean():7.2f}{agg['Z_cut'].mean():10.1f}"
+                f"{agg['dB_bwm'].mean():9.1f}{agg['dB_bw'].mean():9.1f}")
+        line += "".join(f"{(agg['Z_cut'] + l * agg['dB_bwm']).mean():12.1f}"
+                        for l in ZETA_LAMBDAS)
         print(line)
 
     print("\nq*N is per parent nucleus, MeV; no-split is 0 by construction.")
