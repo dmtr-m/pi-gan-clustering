@@ -40,8 +40,15 @@ RUNS_LAMBDA = {(0.0, s): f"outputs/sweep_lambda/l0_s{s}" for s in range(3)}
 RUNS_LAMBDA.update({(0.25, s): f"outputs/sweep_lambda/l0.25_s{s}" for s in range(3)})
 RUNS_LAMBDA.update({(0.5, s): f"outputs/sweep_depth/k4_s{s}" for s in range(3)})
 RUNS_LAMBDA.update({(1.0, s): f"outputs/sweep_lambda/l1.0_s{s}" for s in range(3)})
+# warm-start-only control vs REINFORCE (k=4): rows 0/1/2 are named in ROW_NAMES.
+RUNS_CONTROL = {(0, s): f"outputs/control_warmstart/s{s}" for s in range(3)}
+RUNS_CONTROL.update({(1, s): f"outputs/sweep_depth/k4_s{s}" for s in range(3)})
+RUNS_CONTROL.update({(2, s): f"outputs/sweep_lambda/l0_s{s}" for s in range(3)})
+ROW_NAMES = {"control": {0: "warm-start only", 1: "REINFORCE λ=0.5", 2: "REINFORCE λ=0"}}
 SWEEPS = {"depth": (RUNS_DEPTH, "k", "Depth sweep", "figures/az_sweep_depth.png"),
-          "lambda": (RUNS_LAMBDA, "λ", "Weizsäcker-weight sweep (k=4)", "figures/az_sweep_lambda.png")}
+          "lambda": (RUNS_LAMBDA, "λ", "Weizsäcker-weight sweep (k=4)", "figures/az_sweep_lambda.png"),
+          "control": (RUNS_CONTROL, "", "Warm-start-only control vs REINFORCE (k=4)",
+                      "figures/az_control_warmstart.png")}
 A_MAX, Z_MAX = 132, 60
 
 
@@ -66,7 +73,7 @@ def main() -> None:
         models[key] = (m, cfg["split_k"])
         if args.sweep == "depth":
             assert cfg["split_k"] == key[0], f"{d}: split_k {cfg['split_k']} != {key[0]}"
-        else:
+        elif args.sweep == "lambda":
             assert abs(cfg["bwm_weight"] - key[0]) < 1e-9, f"{d}: bwm_weight != {key[0]}"
 
     loaders = [DataLoader(NucleonDataset(args.data, particle_type=side, n_events=args.n_events),
@@ -102,15 +109,17 @@ def main() -> None:
 
     ref = load_target()
     g = np.array([ref[(ref[:, 0] >= lo) & (ref[:, 0] <= hi), 2].sum() for lo, hi in BINS])
-    depths = sorted({k for k, _ in models})   # the row values (depths or lambdas)
+    depths = sorted({k for k, _ in models})   # the row values (depths, lambdas or row ids)
+    names = ROW_NAMES.get(args.sweep)
+    name_of = (lambda k: names[k]) if names else (lambda k: f"{row_name}={k:g}")
     panels = [(0, 1, "MST d=2.0", mst2), (0, 2, "MSTp d=3.0, p=150", mstp)]
     for i, k in enumerate(depths):
         for s in range(3):
-            panels.append((i + 1, s, f"{row_name}={k:g}, seed {s}", counters[(k, s)]))
+            panels.append((i + 1, s, f"{name_of(k)}, seed {s}", counters[(k, s)]))
     render_grid(panels, ref, n_coll, g, out_path,
                 f"{title} — fragment (A, Z) yield per collision, {n_coll:.0f} collisions",
                 n_rows=1 + len(depths), n_cols=3, a_max=A_MAX, z_max=Z_MAX,
-                row_labels={i + 1: f"{row_name}={k:g}" for i, k in enumerate(depths)}, panel_in=4.2)
+                row_labels={i + 1: name_of(k) for i, k in enumerate(depths)}, panel_in=4.2)
     print_table(panels, ref, n_coll, g)
     print_bands(panels, ref)
 
