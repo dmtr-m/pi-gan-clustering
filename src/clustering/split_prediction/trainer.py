@@ -5,7 +5,7 @@ import numpy as np
 
 from typing import Dict, List, Tuple
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from clustering.split_prediction.progress import StepProgress
 
 from functools import partial
 
@@ -977,8 +977,7 @@ class KSplitTrainer:
                   f"{steps_per_epoch} steps/epoch "
                   f"(batch_size={getattr(self.dataloader, 'batch_size', '?')}, "
                   f"reward_type={self.reward_type}, reward_mode={self.reward_mode})")
-            self._pbar = tqdm(total=total_steps, desc="REINFORCE", unit="step",
-                              mininterval=1.0, dynamic_ncols=True)
+            self._pbar = StepProgress(total_steps, "REINFORCE")
         for ep in range(1, n_epochs + 1):
             lr = self.optim.param_groups[0]["lr"]  # LR used for this epoch
             avg_loss, avg_reward, avg_value_loss, avg_grad_norm, diag = self.train_epoch()
@@ -998,7 +997,7 @@ class KSplitTrainer:
                 history[key].append(diag[key])
             if verbose and ep % log_every == 0:
                 critic_msg = f"  v_loss={avg_value_loss:.3f}" if self.critic is not None else ""
-                tqdm.write(
+                (self._pbar.write if self._pbar is not None else print)(
                     f"[KS] {ep:4d}/{n_epochs}  "
                     f"loss={avg_loss:.4f}  "
                     f"reward={avg_reward:.4f}  "

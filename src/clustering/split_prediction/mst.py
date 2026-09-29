@@ -30,7 +30,7 @@ import torch.optim as optim
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from clustering.split_prediction.progress import StepProgress
 
 from clustering.physics import MOMENTUM_TO_MEV, _pairwise_lorentz_boost
 from clustering.split_prediction.model import SplitPredictionModel
@@ -312,8 +312,7 @@ class MSTPretrainer:
             print(f"[MST] {total_steps} optimizer steps = {n_epochs} epochs x "
                   f"{steps_per_epoch} steps/epoch "
                   f"(batch_size={getattr(self.dataloader, 'batch_size', '?')})")
-            pbar = tqdm(total=total_steps, desc="MST warm-start", unit="step",
-                        mininterval=1.0, dynamic_ncols=True)
+            pbar = StepProgress(total_steps, "MST warm-start")
         for ep in range(1, n_epochs + 1):
             losses, accs = [], []
             for batch in self.dataloader:
@@ -337,7 +336,7 @@ class MSTPretrainer:
             history["loss"].append(float(np.nanmean(losses)))
             history["pair_acc"].append(float(np.nanmean(accs)))
             if verbose and ep % log_every == 0:
-                tqdm.write(
+                (pbar.write if pbar is not None else print)(
                     f"[MST] {ep:4d}/{n_epochs}  "
                     f"loss={history['loss'][-1]:.4f}  "
                     f"pair_acc={history['pair_acc'][-1]:.3f}"
