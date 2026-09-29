@@ -48,11 +48,15 @@ def main() -> None:
     ap.add_argument("--n-events", type=int, default=5000)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--data", default="data/xecs_hse.parquet")
+    ap.add_argument("--lam", type=float, default=None,
+                    help="score with this bwm_weight instead of the run's own (the CSV name "
+                         "then carries it), e.g. to score one model at several lambdas")
     args = ap.parse_args()
 
     run = Path(args.run_dir)
     cfg = yaml.safe_load(open(run / "resolved_config.yaml"))["config"]
-    rt, lam = cfg["reward_type"], cfg["bwm_weight"]
+    rt = cfg["reward_type"]
+    lam = cfg["bwm_weight"] if args.lam is None else args.lam
     if rt == "saca_qmd_minus_b":
         energy = partial(saca_qmd_minus_b_energy, bwm_weight=lam, binding=cfg["bwm_form"])
     elif rt == "zeta_correct":
@@ -131,7 +135,8 @@ def main() -> None:
         print(f"policy leaves events unsplit: {100 * unsplit[sel].mean():.1f}%   "
               f"mean nucleons/event: {n_nuc[sel].mean():.1f}")
 
-    out = run / f"eval_final_sum_{len(n_nuc)}.csv"
+    tag = "" if args.lam is None else f"_lam{args.lam:g}"
+    out = run / f"eval_final_sum_{len(n_nuc)}{tag}.csv"
     with open(out, "w") as f:
         f.write("idx,seen,n_nucleons,unsplit," + ",".join(f"R[{n}]" for n in names)
                 + ",frags[policy],largest[policy]\n")
