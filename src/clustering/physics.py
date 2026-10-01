@@ -12,7 +12,7 @@ from clustering.baselines.qmd_energy import cluster_energy
 from clustering.baselines.qmd_full import full_cluster_energy
 
 
-def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor):
+def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor, pairing_term: bool = True):
     """Weizsäcker semi-empirical binding energy B(A, Z) [MeV] (extensive).
 
     volume − surface − Coulomb − asymmetry + pairing.
@@ -47,7 +47,7 @@ def weizsacker_formula(A: torch.Tensor, Z: torch.Tensor):
         # the penalty came out 4x too weak, Coulomb won, and the predicted valley
         # slid neutron-rich — Z*(128) = 36 against 53 in the HSE nuclei table.
         - a_4 * (A - 2 * Z) ** 2 / A
-        + delta
+        + (delta if pairing_term else 0.0)
     )
 
     return weizsacker_energy
@@ -79,7 +79,7 @@ BWM_A_P = 12.0     # MeV   pairing, paired with A^(-1/2) — NOT A^(-3/4)
 
 
 def bethe_weizsacker(A: torch.Tensor, Z: torch.Tensor,
-                     modified: bool = True) -> torch.Tensor:
+                     modified: bool = True, pairing_term: bool = True) -> torch.Tensor:
     """Binding energy [MeV], positive for a bound nucleus.
 
     ``modified=True`` is the BWM form of Samanta & Adhikari that SACA 2.1 uses
@@ -107,8 +107,65 @@ def bethe_weizsacker(A: torch.Tensor, Z: torch.Tensor,
         - BWM_A_S * torch.pow(A, 2.0 / 3.0)
         - BWM_A_C * Z * (Z - 1.0) / torch.pow(A, 1.0 / 3.0)
         - BWM_A_SYM * (A - 2.0 * Z) ** 2 / asym_denom
-        + delta
+        + (delta if pairing_term else 0.0)
     )
+
+
+# ─── Sharpened binding terms ──────────────────────────────────────────────────
+#
+# The binding is a parabola in Z at fixed A, so its gradient vanishes on the
+# stability valley: one proton off the valley costs ~0.2-0.6% of B (A = 60-150),
+# less than the QMD term's noise, and the pairing term makes the top jagged.
+# These wrap B in a steeper function of D = B_max(A) - B_smooth(A, Z) >= 0, the
+# deficit from the valley, computed on the pairing-free B.  See
+# experiments/weizsacker_sharpened.py for the landscapes.
+#
+#   "cone"  B_max - kappa * (sqrt(D + eps^2) - eps)   |dZ|-like slope near the top
+#   "exp"   B_max * exp(-D / tau)                      sharp ridge, no far pull
+#
+# kappa, eps, tau are UNCALIBRATED guesses (dZ = 1 at A = 100 costs ~5% of B_max).
+# The -kappa*eps in the cone is subtracted so B = B_max exactly on the valley;
+# without it every fragment would carry a constant ~19 MeV penalty and the
+# reward would favor fewer, larger fragments for a reason unrelated to Z.
+_VALLEY_A_CAP = 512
+_valley_cache: dict = {}
+
+
+def _valley_max(binding: str) -> torch.Tensor:
+    """B_max(A) = max over integer Z in [0, A] of the pairing-free B, A = 0..cap."""
+    if binding not in _valley_cache:
+        A = torch.arange(1, _VALLEY_A_CAP + 1).float()[None, :]
+        Z = torch.arange(0, _VALLEY_A_CAP + 1).float()[:, None]
+        A, Z = torch.broadcast_tensors(A, Z)
+        B = _smooth_binding(A, Z, binding)
+        B = torch.where(Z <= A, B, torch.full_like(B, float("-inf")))
+        _valley_cache[binding] = torch.cat([B.new_zeros(1), B.max(dim=0).values])
+    return _valley_cache[binding]
+
+
+def _smooth_binding(A: torch.Tensor, Z: torch.Tensor, binding: str) -> torch.Tensor:
+    return (bethe_weizsacker(A, Z, modified=True, pairing_term=False) if binding == "bwm"
+            else weizsacker_formula(A, Z, pairing_term=False))
+
+
+def sharpened_binding(A: torch.Tensor, Z: torch.Tensor, binding: str, shape: str,
+                      kappa: float = 38.0, eps: float = 0.5, tau: float = 25.0) -> torch.Tensor:
+    """B' (A, Z) [MeV] for ``shape`` in {"cone", "exp"}; A >= 2 only."""
+    Bmax = _valley_max(binding).to(A.device)[A.long().clamp(max=_VALLEY_A_CAP)]
+    D = (Bmax - _smooth_binding(A, Z, binding)).clamp(min=0.0)
+    if shape == "cone":
+        return Bmax - kappa * (torch.sqrt(D + eps ** 2) - eps)
+    if shape == "exp":
+        return Bmax * torch.exp(-D / tau)
+    raise ValueError(f"unknown b_shape {shape!r}; expected 'none', 'cone' or 'exp'")
+
+
+def _binding_term(A: torch.Tensor, Z: torch.Tensor, binding: str, b_shape: str = "none",
+                  b_kappa: float = 38.0, b_eps: float = 0.5, b_tau: float = 25.0) -> torch.Tensor:
+    if b_shape != "none":
+        return sharpened_binding(A, Z, binding, b_shape, b_kappa, b_eps, b_tau)
+    return (bethe_weizsacker(A, Z, modified=True) if binding == "bwm"
+            else weizsacker_formula(A, Z))
 
 
 A_SYM = 23.70  # MeV — Weizsäcker asymmetry coefficient (a_4)
@@ -393,6 +450,10 @@ def qmd_minus_b_energy(
     type_index: int = 7,
     bwm_weight: float = 1.0,
     binding: str = "bwm",
+    b_shape: str = "none",
+    b_kappa: float = 38.0,
+    b_eps: float = 0.5,
+    b_tau: float = 25.0,
 ) -> torch.Tensor:
     """Per-fragment energy of the SACA "QMD - B" objective:  ``E = V - w*B``.
 
@@ -465,8 +526,7 @@ def qmd_minus_b_energy(
     B = torch.zeros_like(A)
     big = A >= 2
     if big.any():
-        B[big] = (bethe_weizsacker(A[big], Z[big], modified=True) if binding == "bwm"
-                  else weizsacker_formula(A[big], Z[big]))
+        B[big] = _binding_term(A[big], Z[big], binding, b_shape, b_kappa, b_eps, b_tau)
     return total_potential_energy(nucleons, mask) - bwm_weight * B
 
 
@@ -479,6 +539,10 @@ def saca_qmd_minus_b_energy(
     eos: str = "soft",
     yukawa: bool = False,
     asymmetry: bool = False,
+    b_shape: str = "none",
+    b_kappa: float = 38.0,
+    b_eps: float = 0.5,
+    b_tau: float = 25.0,
 ) -> torch.Tensor:
     """QMD - B on the **baselines'** QMD energy:  ``E = zeta_QMD*A - w*B``.
 
@@ -534,8 +598,7 @@ def saca_qmd_minus_b_energy(
         if A >= 2 and bwm_weight != 0.0:
             Z = int((sub[:, type_index] == 1).sum())
             A_t, Z_t = torch.tensor([float(A)]), torch.tensor([float(Z)])
-            B = float(bethe_weizsacker(A_t, Z_t, modified=True) if binding == "bwm"
-                      else weizsacker_formula(A_t, Z_t))
+            B = float(_binding_term(A_t, Z_t, binding, b_shape, b_kappa, b_eps, b_tau))
             e = e - bwm_weight * B
         out[b] = e
     return torch.as_tensor(out, dtype=nucleons.dtype, device=nucleons.device)

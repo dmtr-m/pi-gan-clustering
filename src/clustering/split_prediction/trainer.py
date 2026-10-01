@@ -526,6 +526,10 @@ class KSplitTrainer:
         energy_scale: str = "extensive",
         bwm_weight: float = 1.0,
         bwm_form: str = "bwm",
+        b_shape: str = "none",
+        b_kappa: float = 38.0,
+        b_eps: float = 0.5,
+        b_tau: float = 25.0,
         zeta_spin_factor: float = 0.5,
         zeta_yukawa: str = "folded",
         reward_mode: str = "node_diff",
@@ -604,7 +608,10 @@ class KSplitTrainer:
                 )
             fn = (qmd_minus_b_energy if reward_type == "qmd_minus_b"
                   else saca_qmd_minus_b_energy)
-            self.energy_fn = partial(fn, bwm_weight=bwm_weight, binding=bwm_form)
+            if b_shape not in ("none", "cone", "exp"):
+                raise ValueError(f"unknown b_shape {b_shape!r}; expected 'none', 'cone' or 'exp'")
+            self.energy_fn = partial(fn, bwm_weight=bwm_weight, binding=bwm_form, b_shape=b_shape,
+                                     b_kappa=b_kappa, b_eps=b_eps, b_tau=b_tau)
         else:
             raise ValueError(
                 f"unknown reward_type {reward_type!r}; expected 'qmd_asym', "

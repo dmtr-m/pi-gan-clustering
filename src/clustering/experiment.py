@@ -237,6 +237,13 @@ class ClusteringConfig:
     energy_scale: str = "extensive"
     bwm_weight: float = 1.0
     bwm_form: str = "bwm"
+    # b_shape ("none" | "cone" | "exp"): sharpen the B term of qmd_minus_b /
+    # saca_qmd_minus_b around the stability valley (physics.sharpened_binding).
+    # kappa/eps (cone) and tau (exp) are uncalibrated guesses.
+    b_shape: str = "none"
+    b_kappa: float = 38.0
+    b_eps: float = 0.5
+    b_tau: float = 25.0
     # "zeta_correct" = the SACA paper's full zeta (kinetic + Skyrme 2/3-body +
     # Yukawa + Coulomb + Pauli) + bwm_weight·(−B_BWM); bwm_form is ignored (BWM).
     # zeta_spin_factor scales the Pauli term (no spin in the data: 1.0 = all
@@ -510,6 +517,10 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         energy_scale=cfg.energy_scale,
         bwm_weight=cfg.bwm_weight,
         bwm_form=cfg.bwm_form,
+        b_shape=cfg.b_shape,
+        b_kappa=cfg.b_kappa,
+        b_eps=cfg.b_eps,
+        b_tau=cfg.b_tau,
         zeta_spin_factor=cfg.zeta_spin_factor,
         zeta_yukawa=cfg.zeta_yukawa,
         reward_mode=cfg.reward_mode,
@@ -1332,6 +1343,7 @@ def main(cfg: DictConfig) -> None:
         aim_run.add_tag(f"scale:{cfg.energy_scale}")
     if cfg.reward_type in ("qmd_minus_b", "saca_qmd_minus_b"):
         aim_run.add_tag(f"binding:{cfg.bwm_form}")
+        aim_run.add_tag(f"b_shape:{cfg.b_shape}")
         aim_run.add_tag(f"lambda:{cfg.bwm_weight:g}")
     if cfg.reward_type == "zeta_correct":
         aim_run.add_tag(f"lambda:{cfg.bwm_weight:g}")

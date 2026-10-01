@@ -19,3 +19,7 @@ SESSION_SUMMARY.md
 # Experiment run logs and the baseline_grid panel-result cache
 logs/
 .cache/
+
+# Markdown notes stay local (README.md is the one exception)
+*.md
+!README.md
