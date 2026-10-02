@@ -61,7 +61,8 @@ def main() -> None:
         energy = partial(saca_qmd_minus_b_energy, bwm_weight=lam, binding=cfg["bwm_form"])
     elif rt == "zeta_correct":
         energy = partial(zeta_correct_energy, bwm_weight=lam,
-                         spin_factor=cfg["zeta_spin_factor"], yukawa=cfg["zeta_yukawa"])
+                         spin_factor=cfg["zeta_spin_factor"], yukawa=cfg["zeta_yukawa"],
+                         b_per_nucleon=cfg.get("b_per_nucleon", False))
     else:
         raise SystemExit(f"eval_final_sum supports saca_qmd_minus_b / zeta_correct, not {rt}")
     k, n_train = cfg["split_k"], cfg["n_events"]

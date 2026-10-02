@@ -244,6 +244,8 @@ class ClusteringConfig:
     b_kappa: float = 38.0
     b_eps: float = 0.5
     b_tau: float = 25.0
+    # b_per_nucleon: zeta_correct only; use B/A instead of B in the lambda term.
+    b_per_nucleon: bool = False
     # "zeta_correct" = the SACA paper's full zeta (kinetic + Skyrme 2/3-body +
     # Yukawa + Coulomb + Pauli) + bwm_weight·(−B_BWM); bwm_form is ignored (BWM).
     # zeta_spin_factor scales the Pauli term (no spin in the data: 1.0 = all
@@ -521,6 +523,7 @@ def train_split_model(exp: Ctx, dataset: NucleonDataset) -> SplitPredictionModel
         b_kappa=cfg.b_kappa,
         b_eps=cfg.b_eps,
         b_tau=cfg.b_tau,
+        b_per_nucleon=cfg.b_per_nucleon,
         zeta_spin_factor=cfg.zeta_spin_factor,
         zeta_yukawa=cfg.zeta_yukawa,
         reward_mode=cfg.reward_mode,

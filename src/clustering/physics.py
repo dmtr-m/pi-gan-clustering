@@ -611,6 +611,11 @@ def zeta_correct_energy(
     bwm_weight: float = 1.0,
     spin_factor: float = 0.5,
     yukawa: str = "folded",
+    b_shape: str = "none",
+    b_kappa: float = 38.0,
+    b_eps: float = 0.5,
+    b_tau: float = 25.0,
+    b_per_nucleon: bool = False,
 ) -> torch.Tensor:
     """The SACA paper's zeta with the full QMD, plus a Weizsacker term, as a reward.
 
@@ -641,8 +646,13 @@ def zeta_correct_energy(
         e = full_cluster_energy(sub, spin_factor=spin_factor, yukawa=yukawa).total
         if bwm_weight != 0.0:
             Z = int((sub[:, type_index] == 1).sum())
-            B = float(bethe_weizsacker(torch.tensor([float(A)]),
-                                       torch.tensor([float(Z)]), modified=True))
+            A_t, Z_t = torch.tensor([float(A)]), torch.tensor([float(Z)])
+            if b_shape == "none":
+                B = float(bethe_weizsacker(A_t, Z_t, modified=True))
+            else:
+                B = float(_binding_term(A_t, Z_t, "bwm", b_shape, b_kappa, b_eps, b_tau))
+            if b_per_nucleon:
+                B = B / A      # B/A in MeV per nucleon: a size-independent per-fragment term
             e = e - bwm_weight * B
         out[b] = e
     return torch.as_tensor(out, dtype=nucleons.dtype, device=nucleons.device)

@@ -530,6 +530,7 @@ class KSplitTrainer:
         b_kappa: float = 38.0,
         b_eps: float = 0.5,
         b_tau: float = 25.0,
+        b_per_nucleon: bool = False,
         zeta_spin_factor: float = 0.5,
         zeta_yukawa: str = "folded",
         reward_mode: str = "node_diff",
@@ -592,6 +593,8 @@ class KSplitTrainer:
             self.energy_fn = partial(
                 zeta_correct_energy, bwm_weight=bwm_weight,
                 spin_factor=zeta_spin_factor, yukawa=zeta_yukawa,
+                b_shape=b_shape, b_kappa=b_kappa, b_eps=b_eps, b_tau=b_tau,
+                b_per_nucleon=b_per_nucleon,
             )
         elif reward_type == "weizsacker_qmd":
             if energy_scale not in ("extensive", "per_nucleon"):
