@@ -12,6 +12,7 @@ multirun/
 .aim/
 *.pt
 data/
+!src/clustering/data/
 # Local working notes for Claude Code sessions (untracked on purpose)
 CLAUDE.md
 SESSION_SUMMARY.md
